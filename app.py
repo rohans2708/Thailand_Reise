@@ -7,6 +7,7 @@ import re
 import unicodedata
 from urllib.parse import quote
 from uuid import uuid4
+import os
 
 import pandas as pd
 import streamlit as st
@@ -15,12 +16,17 @@ st.set_page_config(page_title="Thailand Auto-Konfigurator", page_icon="TH", layo
 
 try:
     from streamlit_cookies_manager import EncryptedCookieManager
-
     COOKIE_LIB_AVAILABLE = True
 except ImportError:
     EncryptedCookieManager = None
     COOKIE_LIB_AVAILABLE = False
 
+# Supabase optional
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
 
 BASE_DIR = Path(__file__).parent
 CSV_UNTERKUENFTE = BASE_DIR / "unterkuenfte.csv"
@@ -948,6 +954,37 @@ def main() -> None:
                 )
             else:
                 st.sidebar.info("Noch keine Speicherstände vorhanden.")
+
+        # Neue Export-Buttons
+        st.sidebar.markdown("### Daten-Export")
+        col1, col2, col3 = st.sidebar.columns(3)
+        
+        with col1:
+            if CSV_USER_SAVES.exists():
+                st.download_button(
+                    "📥 Reisen",
+                    CSV_USER_SAVES.read_bytes(),
+                    "speicherstaende.csv",
+                    use_container_width=True
+                )
+        
+        with col2:
+            if CSV_ACTIVITY_SUGGESTIONS.exists():
+                st.download_button(
+                    "📥 Vorschläge",
+                    CSV_ACTIVITY_SUGGESTIONS.read_bytes(),
+                    "aktivitaeten_vorschlaege.csv",
+                    use_container_width=True
+                )
+        
+        with col3:
+            if CSV_AKTIVITAETEN.exists():
+                st.download_button(
+                    "📥 Aktivitäten",
+                    CSV_AKTIVITAETEN.read_bytes(),
+                    "aktivitaeten.csv",
+                    use_container_width=True
+                )
 
     flight_df = df_transporte[df_transporte["Typ"].astype(str).str.lower() == "flug"].copy()
     flight_df["NameNorm"] = flight_df["Name"].map(normalize_text)
