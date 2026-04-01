@@ -1,0 +1,1337 @@
+"""Thailand Reiseplaner als bildbasierter Auto-Konfigurator."""
+
+from datetime import datetime
+import json
+from pathlib import Path
+import re
+import unicodedata
+from urllib.parse import quote
+from uuid import uuid4
+
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Thailand Auto-Konfigurator", page_icon="TH", layout="wide")
+
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+
+    COOKIE_LIB_AVAILABLE = True
+except ImportError:
+    EncryptedCookieManager = None
+    COOKIE_LIB_AVAILABLE = False
+
+
+BASE_DIR = Path(__file__).parent
+CSV_UNTERKUENFTE = BASE_DIR / "unterkuenfte.csv"
+CSV_AKTIVITAETEN = BASE_DIR / "aktivitaeten.csv"
+CSV_TRANSPORTE = BASE_DIR / "transporte.csv"
+CSV_SUBMISSIONS = BASE_DIR / "traumreisen_submissions.csv"
+CSV_USER_SAVES = BASE_DIR / "traumreisen_speicherstaende.csv"
+CSV_ACTIVITY_SUGGESTIONS = BASE_DIR / "aktivitaeten_vorschlaege.csv"
+
+COOKIE_NAME = "thailand_trip_state"
+PERSIST_KEYS = [
+    "user_name",
+    "sel_flight",
+    "sel_bkk_hotel",
+    "sel_island_home",
+    "sel_bkk_act",
+    "sel_island_act",
+    "days_bangkok",
+    "days_island",
+    "local_transport_per_day_pp",
+    "food_per_day_pp",
+    "breakfast_discount_per_day_pp",
+    "num_travelers",
+]
+
+
+def get_cookie_manager():
+    if not COOKIE_LIB_AVAILABLE:
+        return None
+    if "cookie_manager" not in st.session_state:
+        st.session_state["cookie_manager"] = EncryptedCookieManager(
+            prefix="thailand_app/",
+            password="thailand-streamlit-cookie-key",
+        )
+    return st.session_state["cookie_manager"]
+
+
+def load_persisted_state() -> None:
+    if st.session_state.get("_persist_loaded"):
+        return
+
+    payload = None
+    cookies = get_cookie_manager()
+    if cookies is not None and cookies.ready():
+        raw = cookies.get(COOKIE_NAME)
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = None
+
+    payload = normalize_state_payload(payload)
+    if payload:
+        for key in PERSIST_KEYS:
+            if key in payload and key not in st.session_state:
+                st.session_state[key] = payload[key]
+
+    st.session_state["_persist_loaded"] = True
+
+
+def save_persisted_state() -> None:
+    state = normalize_state_payload({key: st.session_state.get(key) for key in PERSIST_KEYS})
+    # user_name bleibt als String erhalten
+    state["user_name"] = st.session_state.get("user_name")
+    cookies = get_cookie_manager()
+    if cookies is not None and cookies.ready():
+        cookies[COOKIE_NAME] = json.dumps(state)
+        cookies.save()
+
+
+def append_submission(record: dict[str, object]) -> None:
+    submission_df = pd.DataFrame([record])
+    if CSV_SUBMISSIONS.exists():
+        existing = pd.read_csv(CSV_SUBMISSIONS)
+        existing = pd.concat([existing, submission_df], ignore_index=True)
+        existing.to_csv(CSV_SUBMISSIONS, index=False)
+    else:
+        submission_df.to_csv(CSV_SUBMISSIONS, index=False)
+
+
+def save_user_snapshot(record: dict[str, object]) -> None:
+    """Speichert den aktuellen Stand je Name (letzter Stand gewinnt)."""
+    row = pd.DataFrame([record])
+    if CSV_USER_SAVES.exists():
+        existing = pd.read_csv(CSV_USER_SAVES)
+        existing.columns = [str(col).strip() for col in existing.columns]
+        existing = existing[existing["Name"].astype(str).str.lower() != str(record["Name"]).lower()]
+        merged = pd.concat([existing, row], ignore_index=True)
+        merged.to_csv(CSV_USER_SAVES, index=False)
+    else:
+        row.to_csv(CSV_USER_SAVES, index=False)
+
+
+def load_user_snapshot(user_name: str) -> dict[str, object] | None:
+    if not CSV_USER_SAVES.exists() or not str(user_name).strip():
+        return None
+    saved = pd.read_csv(CSV_USER_SAVES)
+    saved.columns = [str(col).strip() for col in saved.columns]
+    matches = saved[saved["Name"].astype(str).str.lower() == str(user_name).strip().lower()]
+    if matches.empty:
+        return None
+    row = matches.sort_values("Zeitstempel", ascending=True).iloc[-1]
+    raw_state = str(row.get("StateJson", "")).strip()
+    if not raw_state:
+        return None
+    try:
+        payload = json.loads(raw_state)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return normalize_state_payload(payload)
+
+
+def get_initial_value(key: str, default: object, snapshot: dict[str, object] | None) -> object:
+    """Gibt Wert aus Snapshot, dann Session State, dann Default zurück."""
+    if snapshot and key in snapshot:
+        return snapshot[key]
+    if key in st.session_state:
+        return st.session_state[key]
+    return default
+
+
+def _to_optional_int(value: object) -> int | None:
+    """Konvertiert gemischte Werte sicher zu int oder None."""
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan"}:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int_list(value: object) -> list[int]:
+    """Konvertiert gemischte Werte (z. B. JSON-String, NaN, Einzelwert) sicher zu int-Liste."""
+    if value is None:
+        return []
+    if isinstance(value, float) and pd.isna(value):
+        return []
+
+    items: list[object]
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"none", "nan"}:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                items = list(parsed) if isinstance(parsed, list) else [parsed]
+            except json.JSONDecodeError:
+                items = [part.strip() for part in text.split(",") if part.strip()]
+        else:
+            items = [part.strip() for part in text.split(",") if part.strip()]
+    else:
+        items = [value]
+
+    out: list[int] = []
+    for item in items:
+        val = _to_optional_int(item)
+        if val is not None:
+            out.append(val)
+    return out
+
+
+def normalize_state_payload(payload: dict[str, object] | None) -> dict[str, object]:
+    """Bereinigt gespeicherte Zustände aus CSV/Cookies robust auf erwartete Typen."""
+    if not isinstance(payload, dict):
+        return {}
+
+    cleaned = dict(payload)
+    cleaned["sel_flight"] = _to_optional_int(cleaned.get("sel_flight"))
+    cleaned["sel_bkk_hotel"] = _to_optional_int(cleaned.get("sel_bkk_hotel"))
+    cleaned["sel_island_home"] = _to_optional_int(cleaned.get("sel_island_home"))
+    cleaned["sel_bkk_act"] = _to_int_list(cleaned.get("sel_bkk_act"))
+    cleaned["sel_island_act"] = _to_int_list(cleaned.get("sel_island_act"))
+    return cleaned
+
+
+def _empty_suggestions_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "SuggestionId",
+            "Zeitstempel",
+            "ProposedBy",
+            "Status",
+            "ReviewedBy",
+            "ReviewedAt",
+            "Name",
+            "Kosten",
+            "Standort",
+            "Link",
+            "Bild",
+            "Details",
+        ]
+    )
+
+
+def load_activity_suggestions() -> pd.DataFrame:
+    if not CSV_ACTIVITY_SUGGESTIONS.exists():
+        return _empty_suggestions_df()
+    df = pd.read_csv(CSV_ACTIVITY_SUGGESTIONS)
+    df.columns = [str(col).strip() for col in df.columns]
+    for col in _empty_suggestions_df().columns:
+        if col not in df.columns:
+            df[col] = ""
+    df["SuggestionId"] = df["SuggestionId"].astype(str).str.strip()
+    df["Status"] = df["Status"].astype(str).str.strip().str.lower().replace({"": "pending"})
+    return df[_empty_suggestions_df().columns]
+
+
+def save_activity_suggestions(df: pd.DataFrame) -> None:
+    safe = df.copy()
+    safe.to_csv(CSV_ACTIVITY_SUGGESTIONS, index=False)
+
+
+def submit_activity_suggestion(user_name: str, payload: dict[str, object]) -> None:
+    df = load_activity_suggestions()
+    row = {
+        "SuggestionId": str(uuid4()),
+        "Zeitstempel": datetime.now().isoformat(timespec="seconds"),
+        "ProposedBy": str(user_name).strip(),
+        "Status": "pending",
+        "ReviewedBy": "",
+        "ReviewedAt": "",
+        "Name": str(payload.get("Name", "Eigene Aktivitaet")).strip() or "Eigene Aktivitaet",
+        "Kosten": float(payload.get("Kosten", 0) or 0),
+        "Standort": str(payload.get("Standort", "Bangkok")).strip() or "Bangkok",
+        "Link": str(payload.get("Link", "")).strip(),
+        "Bild": str(payload.get("Bild", "")).strip(),
+        "Details": str(payload.get("Details", "Keine Details angegeben")).strip() or "Keine Details angegeben",
+    }
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    save_activity_suggestions(df)
+
+
+def list_open_suggestions_for_user(user_name: str) -> pd.DataFrame:
+    df = load_activity_suggestions()
+    if df.empty:
+        return df
+    mask = (df["ProposedBy"].astype(str).str.lower() == str(user_name).strip().lower()) & (df["Status"] == "pending")
+    return df[mask].copy()
+
+
+def list_pending_suggestions() -> pd.DataFrame:
+    df = load_activity_suggestions()
+    if df.empty:
+        return df
+    return df[df["Status"] == "pending"].copy()
+
+
+def _append_activity_to_catalog(activity: pd.Series) -> None:
+    base = pd.read_csv(CSV_AKTIVITAETEN)
+    base.columns = [str(col).strip() for col in base.columns]
+    base = ensure_columns(base, {"Link": "", "Bild": "", "Details": ""})
+
+    candidate_name = str(activity.get("Name", "")).strip()
+    candidate_loc = str(activity.get("Standort", "")).strip()
+    candidate_cost = float(activity.get("Kosten", 0) or 0)
+
+    duplicate_mask = (
+        base["Name"].astype(str).str.strip().str.lower().eq(candidate_name.lower())
+        & base["Standort"].astype(str).str.strip().str.lower().eq(candidate_loc.lower())
+        & pd.to_numeric(base["Kosten"], errors="coerce").fillna(0.0).round(2).eq(round(candidate_cost, 2))
+    )
+    if duplicate_mask.any():
+        return
+
+    new_row = {
+        "Name": candidate_name,
+        "Kosten": candidate_cost,
+        "Standort": candidate_loc,
+        "Link": str(activity.get("Link", "")).strip(),
+        "Bild": str(activity.get("Bild", "")).strip(),
+        "Details": str(activity.get("Details", "")).strip() or "Keine Details angegeben",
+    }
+    base = pd.concat([base, pd.DataFrame([new_row])], ignore_index=True)
+    base.to_csv(CSV_AKTIVITAETEN, index=False)
+
+
+def review_suggestion(suggestion_id: str, approved: bool, reviewer: str) -> bool:
+    df = load_activity_suggestions()
+    if df.empty:
+        return False
+
+    sid = str(suggestion_id).strip()
+    matches = df.index[df["SuggestionId"].astype(str).str.strip() == sid].tolist()
+    if not matches:
+        return False
+
+    idx = matches[0]
+    if str(df.at[idx, "Status"]).strip().lower() != "pending":
+        return False
+
+    if approved:
+        _append_activity_to_catalog(df.loc[idx])
+        df.at[idx, "Status"] = "approved"
+    else:
+        df.at[idx, "Status"] = "rejected"
+
+    df.at[idx, "ReviewedBy"] = str(reviewer).strip()
+    df.at[idx, "ReviewedAt"] = datetime.now().isoformat(timespec="seconds")
+    save_activity_suggestions(df)
+    return True
+
+
+def apply_snapshot_to_state(payload: dict[str, object] | None) -> None:
+    """Übernimmt gespeicherte Werte in den Session-State (ohne user_name zu überschreiben)."""
+    if not payload:
+        return
+    for key in PERSIST_KEYS:
+        if key == "user_name":
+            continue
+        if key in payload:
+            st.session_state[key] = payload[key]
+
+
+def selected_names(df: pd.DataFrame) -> str:
+    if df.empty:
+        return ""
+    return " | ".join(df["Name"].astype(str).tolist())
+
+
+def create_dummy_csv_files() -> None:
+    """Erzeugt Demo-CSV-Dateien, falls keine Dateien vorhanden sind."""
+    if not CSV_UNTERKUENFTE.exists():
+        pd.DataFrame(
+            {
+                "Name": [
+                    "The Peninsula Bangkok",
+                    "Mandarin Oriental Bangkok",
+                    "Bangkok Riverside Suites",
+                    "Lamai Sea View Apartment",
+                    "Bophut Family Residence",
+                    "Phuket Beach Apartment",
+                    "Patong Hill Residence",
+                ],
+                "Kosten": [900, 1200, 600, 420, 510, 460, 540],
+                "Standort": ["Bangkok", "Bangkok", "Bangkok", "Ko Samui", "Ko Samui", "Phuket", "Phuket"],
+                "Link": [
+                    "https://example.com/peninsula-bangkok",
+                    "https://example.com/mandarin-bangkok",
+                    "https://www.airbnb.com/s/Bangkok--Thailand/homes",
+                    "https://www.airbnb.com/s/Ko-Samui--Thailand/homes",
+                    "https://www.airbnb.com/s/Bo-Phut--Thailand/homes",
+                    "https://www.airbnb.com/s/Phuket--Thailand/homes",
+                    "https://www.airbnb.com/s/Patong--Thailand/homes",
+                ],
+                "Bild": ["", "", "", "", "", "", ""],
+                "Details": [
+                    "Luxushotel mit Flussblick",
+                    "Top-Service und zentrale Lage",
+                    "Preiswerte Option in Bangkok",
+                    "Ruhig und strandnah",
+                    "Ideal fuer Gruppen",
+                    "Direkt am Strand",
+                    "Gute Aussicht und ruhig",
+                ],
+                "Vorteile": ["", "", "", "", "", "", ""],
+                "Nachteile": ["", "", "", "", "", "", ""],
+                "AirportTransfer": ["Angeboten", "Angeboten", "Selbst", "Selbst", "Angeboten", "Selbst", "Angeboten"],
+                "TransferKosten": [60, 75, 40, 35, 25, 30, 20],
+                "FruehstueckInklusive": ["Ja", "Ja", "Nein", "Nein", "Nein", "Nein", "Ja"],
+            }
+        ).to_csv(CSV_UNTERKUENFTE, index=False)
+
+    if not CSV_AKTIVITAETEN.exists():
+        pd.DataFrame(
+            {
+                "Name": [
+                    "Grand Palace Tour",
+                    "Street Food Night Tour",
+                    "Floating Market Day Trip",
+                    "Ang Thong National Park Boat Trip",
+                    "Ko Samui Elephant Sanctuary",
+                    "Phang Nga Bay Tour",
+                    "Phuket Old Town Food Walk",
+                ],
+                "Kosten": [45, 39, 60, 75, 55, 82, 34],
+                "Standort": ["Bangkok", "Bangkok", "Bangkok", "Ko Samui", "Ko Samui", "Phuket", "Phuket"],
+                "Link": [
+                    "https://example.com/grand-palace",
+                    "https://example.com/street-food",
+                    "https://example.com/floating-market",
+                    "https://example.com/ang-thong",
+                    "https://example.com/elephant-sanctuary",
+                    "https://example.com/phang-nga",
+                    "https://example.com/phuket-old-town",
+                ],
+                "Bild": ["", "", "", "", "", "", ""],
+                "Details": [
+                    "Gefuehrte Tour durch Tempel und Altstadt",
+                    "Street-Food Stops mit Guide",
+                    "Tagesausflug mit Boot und Marktbesuch",
+                    "Ganztages-Bootstour zu Inseln",
+                    "Ethisches Sanctuary ohne Reiten",
+                    "Naturtour mit Speedboat",
+                    "Kulinarischer Stadtspaziergang",
+                ],
+            }
+        ).to_csv(CSV_AKTIVITAETEN, index=False)
+
+    if not CSV_TRANSPORTE.exists():
+        pd.DataFrame(
+            {
+                "Name": [
+                    "Flug Frankfurt - Bangkok (Hin und Rueckflug)",
+                    "Flug Muenchen - Bangkok (Hin und Rueckflug)",
+                    "Flug Bangkok - Phuket",
+                    "Flug Bangkok - Ko Samui",
+                    "Fähre Phuket - Ko Samui",
+                ],
+                "Kosten": [780, 720, 130, 165, 48],
+                "Typ": ["Flug", "Flug", "Flug", "Flug", "Fähre"],
+            }
+        ).to_csv(CSV_TRANSPORTE, index=False)
+
+
+def load_csv_files() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def _read_clean(path: Path) -> pd.DataFrame:
+        df = pd.read_csv(path)
+        # Nutzer-CSV kann Spalten mit Leerzeichen enthalten (z. B. " Bild").
+        df.columns = [str(col).strip() for col in df.columns]
+        return df
+
+    return _read_clean(CSV_UNTERKUENFTE), _read_clean(CSV_AKTIVITAETEN), _read_clean(CSV_TRANSPORTE)
+
+
+def ensure_columns(df: pd.DataFrame, defaults: dict[str, object]) -> pd.DataFrame:
+    out = df.copy()
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+    return out
+
+
+def normalize_text(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def normalize_location(raw_location: str, row_name: str) -> str:
+    loc = normalize_text(raw_location)
+    name = normalize_text(row_name)
+    if "bangkok" in loc:
+        return "Bangkok"
+    if "samui" in loc:
+        return "Ko Samui"
+    if "phuket" in loc:
+        return "Phuket"
+    if "insel" in loc or "island" in loc:
+        if "samui" in name:
+            return "Ko Samui"
+        if "phuket" in name:
+            return "Phuket"
+        return "Insel"
+    if "samui" in name:
+        return "Ko Samui"
+    if "phuket" in name:
+        return "Phuket"
+    return "Bangkok"
+
+
+def prepare_location_column(df: pd.DataFrame) -> pd.DataFrame:
+    normalized = df.copy()
+    normalized["StandortNorm"] = [
+        normalize_location(loc, name) for loc, name in zip(df["Standort"], df["Name"], strict=False)
+    ]
+    return normalized
+
+
+def format_currency(amount: float) -> str:
+    return f"EUR {amount:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def build_default_image_url(name: str, prefix: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]", "-", normalize_text(name)).strip("-")
+    return f"https://picsum.photos/seed/{quote(prefix + '-' + slug)}/640/360"
+
+
+def attach_image_column(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    enriched = df.copy()
+    urls: list[str] = []
+    for _, row in enriched.iterrows():
+        candidate = str(row.get("Bild", "")).strip()
+        urls.append(candidate if candidate else build_default_image_url(str(row["Name"]), prefix))
+    enriched["BildUrl"] = urls
+    return enriched
+
+
+def find_domestic_flight(transporte_df: pd.DataFrame, destination: str) -> pd.Series | None:
+    flights = transporte_df[transporte_df["Typ"].astype(str).str.lower() == "flug"].copy()
+    if flights.empty:
+        return None
+    if destination not in {"Phuket", "Ko Samui"}:
+        return None
+    flights["NameNorm"] = flights["Name"].map(normalize_text)
+    dest_keys = ["phuket"] if destination == "Phuket" else ["ko samui", "koh samui", "samui"]
+    matches = flights[
+        flights["NameNorm"].str.contains("bangkok", na=False)
+        & flights["NameNorm"].apply(lambda n: any(k in n for k in dest_keys))
+    ]
+    if matches.empty:
+        return None
+    return matches.sort_values("Kosten", ascending=True).iloc[0]
+
+
+def resolve_island_destination(accommodation: pd.Series | None) -> str | None:
+    """Leitet die Zielinsel robust aus Standort, Name und Link ab."""
+    if accommodation is None:
+        return None
+
+    normalized_location = normalize_text(accommodation.get("StandortNorm", ""))
+    if "phuket" in normalized_location:
+        return "Phuket"
+    if "samui" in normalized_location:
+        return "Ko Samui"
+
+    hints = normalize_text(f"{accommodation.get('Name', '')} {accommodation.get('Link', '')}")
+    if "phuket" in hints:
+        return "Phuket"
+    if "samui" in hints or "koh samui" in hints or "ko samui" in hints:
+        return "Ko Samui"
+    return None
+
+
+def is_island_accommodation(row: pd.Series) -> bool:
+    """Erkennt Insel-Unterkuenfte robust auch bei inkonsistenten Standortfeldern."""
+    loc = normalize_text(row.get("StandortNorm", ""))
+    if loc in {"ko samui", "phuket", "insel"}:
+        return True
+    hints = normalize_text(f"{row.get('Standort', '')} {row.get('Name', '')} {row.get('Link', '')}")
+    return any(token in hints for token in ["samui", "phuket", "island", "insel"])
+
+
+def render_accommodation_info(row: pd.Series, expanded: bool = False) -> None:
+    offered = str(row.get("AirportTransfer", "Selbst")).strip().lower() in {"angeboten", "ja", "yes"}
+    transfer_mode = "Angeboten" if offered else "Selbst organisieren"
+    transfer_cost = float(row.get("TransferKosten", 0) or 0)
+    with st.expander("Infos anzeigen", expanded=expanded):
+        st.write(f"**Kurzbeschreibung:** {str(row.get('Details', '')).strip() or 'Keine Angabe'}")
+        st.write(f"**Vorteile:** {str(row.get('Vorteile', '')).strip() or 'Keine Angabe'}")
+        st.write(f"**Nachteile:** {str(row.get('Nachteile', '')).strip() or 'Keine Angabe'}")
+        breakfast = str(row.get("FruehstueckInklusive", "Nein")).strip().lower() in {"ja", "yes", "true", "1"}
+        st.write(f"**Frühstück inklusive:** {'Ja' if breakfast else 'Nein'}")
+        st.write(f"**Airport-Transfer:** {transfer_mode}")
+        st.write(f"**Transferkosten:** {format_currency(transfer_cost)}")
+        link = str(row.get("Link", "")).strip()
+        if link:
+            st.markdown(f"[Zum Anbieter]({link})")
+        else:
+            city = quote(str(row.get("StandortNorm", "Thailand")))
+            st.markdown(f"[Beispiel auf Airbnb suchen](https://www.airbnb.com/s/{city}/homes)")
+
+
+def render_activity_info(row: pd.Series, expanded: bool = False) -> None:
+    with st.expander("Infos anzeigen", expanded=expanded):
+        st.write(f"**Beschreibung:** {str(row.get('Details', '')).strip() or 'Keine Angabe'}")
+        link = str(row.get("Link", "")).strip()
+        if link:
+            st.markdown(f"[Zur Aktivität]({link})")
+        else:
+            query = quote(f"{row.get('Name', '')} {row.get('StandortNorm', 'Thailand')}")
+            st.markdown(f"[Beispiel-Link (Suche)](https://www.google.com/search?q={query})")
+
+
+def image_select_grid(
+    df: pd.DataFrame,
+    scope: str,
+    selected: list[int] | int | None,
+    multiple: bool,
+    subtitle: str,
+    info_mode: str | None = None,
+) -> None:
+    st.caption(subtitle)
+    cols_per_row = 3
+    indices = df.index.tolist()
+    for start in range(0, len(indices), cols_per_row):
+        row_cols = st.columns(cols_per_row)
+        for col, idx in zip(row_cols, indices[start : start + cols_per_row], strict=False):
+            row = df.loc[idx]
+            is_selected = idx in selected if isinstance(selected, list) else idx == selected
+            border = "3px solid #16a34a" if is_selected else "1px solid #d1d5db"
+            with col:
+                st.markdown(
+                    f'<img src="{row["BildUrl"]}" style="width:100%;height:180px;object-fit:cover;border-radius:10px;border:{border};"/>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"**{row['Name']}**")
+                st.write(f"{format_currency(float(row['Kosten']))}")
+                if "StandortNorm" in row:
+                    st.caption(f"Ort: {row['StandortNorm']}")
+                if info_mode == "accommodation":
+                    render_accommodation_info(row)
+                if info_mode == "activity":
+                    render_activity_info(row)
+                if multiple:
+                    btn_label = "Markierung entfernen" if is_selected else "Markieren"
+                    if st.button(btn_label, key=f"btn_{scope}_{idx}", use_container_width=True):
+                        state_key = f"sel_{scope}"
+                        selected_set = set(st.session_state.get(state_key, []))
+                        if idx in selected_set:
+                            selected_set.remove(idx)
+                        else:
+                            selected_set.add(idx)
+                        st.session_state[state_key] = sorted(selected_set)
+                        # Bei manuellem rerun sonst keine Persistierung -> Fortschritt geht beim Reload verloren.
+                        save_persisted_state()
+                        st.rerun()
+                else:
+                    btn_label = "Ausgewählt" if is_selected else "Auswählen"
+                    if st.button(btn_label, key=f"btn_{scope}_{idx}", use_container_width=True):
+                        st.session_state[f"sel_{scope}"] = idx
+                        save_persisted_state()
+                        st.rerun()
+
+
+def calculate_summary(
+    intl_flight: pd.Series | None,
+    domestic_flight: pd.Series | None,
+    bkk_hotel: pd.Series | None,
+    island_home: pd.Series | None,
+    bkk_acts: pd.DataFrame,
+    island_acts: pd.DataFrame,
+    num_travelers: int,
+    days_bangkok: int,
+    days_island: int,
+    local_transport_per_day_pp: float,
+    food_per_day_pp: float,
+    breakfast_discount_per_day_pp: float,
+) -> tuple[float, list[dict[str, object]], float, float, float, float, float, float, float]:
+    rows: list[dict[str, object]] = []
+    costs_flights = 0.0
+    costs_transport_other = 0.0
+    costs_accommodation = 0.0
+    costs_bkk_hotel = 0.0
+    costs_island_home = 0.0
+    costs_activities = 0.0
+    costs_food = 0.0
+
+    if intl_flight is not None:
+        costs_flights += float(intl_flight["Kosten"])
+        rows.append({"Kategorie": "Flug nach Bangkok", "Name": intl_flight["Name"], "Kosten": float(intl_flight["Kosten"])})
+
+    if domestic_flight is not None:
+        costs_flights += float(domestic_flight["Kosten"])
+        rows.append({"Kategorie": "Inlandsflug", "Name": domestic_flight["Name"], "Kosten": float(domestic_flight["Kosten"])})
+
+    # Endberechnung pro Person:
+    # - Alle Positionen gelten als bereits pro Kopf
+    # - Nur die Ferienwohnung wird anteilig durch die Personenzahl geteilt
+    for accom, label in ((bkk_hotel, "Hotel Bangkok"), (island_home, "Ferienwohnung")):
+        if accom is None:
+            continue
+        nightly_cost = float(accom["Kosten"])
+        nights = max(0, days_bangkok if label == "Hotel Bangkok" else days_island)
+        transfer_cost = float(accom.get("TransferKosten", 0) or 0)
+        if label == "Ferienwohnung":
+            total_home_cost = nightly_cost * float(nights)
+            share_per_person = total_home_cost / float(num_travelers)
+            costs_accommodation += share_per_person
+            costs_island_home += share_per_person
+            rows.append(
+                {
+                    "Kategorie": "Ferienwohnung (anteilig pro Person)",
+                    "Name": f"{accom['Name']} ({nights} Nächte, gesamt {format_currency(total_home_cost)})",
+                    "Kosten": share_per_person,
+                }
+            )
+        else:
+            hotel_cost_pp = nightly_cost * float(nights)
+            costs_accommodation += hotel_cost_pp
+            costs_bkk_hotel += hotel_cost_pp
+            rows.append(
+                {
+                    "Kategorie": label,
+                    "Name": f"{accom['Name']} ({nights} Nächte)",
+                    "Kosten": hotel_cost_pp,
+                }
+            )
+
+        costs_transport_other += transfer_cost
+        rows.append(
+            {
+                "Kategorie": f"Airport-Transfer {label}",
+                "Name": str(accom.get("AirportTransfer", "Selbst")),
+                "Kosten": transfer_cost,
+            }
+        )
+
+    for _, row in pd.concat([bkk_acts, island_acts]).iterrows():
+        activity_cost = float(row["Kosten"])
+        costs_activities += activity_cost
+        rows.append({"Kategorie": "Aktivität", "Name": row["Name"], "Kosten": activity_cost})
+
+    total_days = max(0, days_bangkok) + max(0, days_island)
+    local_transport_total = float(local_transport_per_day_pp) * float(total_days)
+    costs_transport_other += local_transport_total
+    rows.append(
+        {
+            "Kategorie": "Transport vor Ort (Schätzung, pro Person)",
+            "Name": f"{total_days} Tage",
+            "Kosten": local_transport_total,
+        }
+    )
+
+    food_gross = float(food_per_day_pp) * float(total_days)
+    breakfast_days = 0
+    if bkk_hotel is not None:
+        bkk_breakfast = str(bkk_hotel.get("FruehstueckInklusive", "Nein")).strip().lower() in {"ja", "yes", "true", "1"}
+        if bkk_breakfast:
+            breakfast_days += max(0, days_bangkok)
+    if island_home is not None:
+        island_breakfast = str(island_home.get("FruehstueckInklusive", "Nein")).strip().lower() in {"ja", "yes", "true", "1"}
+        if island_breakfast:
+            breakfast_days += max(0, days_island)
+
+    breakfast_discount = float(breakfast_discount_per_day_pp) * float(breakfast_days)
+    breakfast_discount = min(food_gross, breakfast_discount)
+    costs_food = max(0.0, food_gross - breakfast_discount)
+
+    rows.append({"Kategorie": "Verpflegung (Schätzung, pro Person)", "Name": f"{total_days} Tage", "Kosten": food_gross})
+    if breakfast_discount > 0:
+        rows.append(
+            {
+                "Kategorie": "Abzug Fruehstueck inklusive (pro Person)",
+                "Name": f"{breakfast_days} Tage",
+                "Kosten": -breakfast_discount,
+            }
+        )
+
+    rows.append({"Kategorie": "Verpflegung netto", "Name": "Nach Abzug", "Kosten": costs_food})
+
+    per_person = costs_flights + costs_transport_other + costs_accommodation + costs_activities + costs_food
+    return (
+        per_person,
+        rows,
+        costs_flights,
+        costs_transport_other,
+        costs_accommodation,
+        costs_bkk_hotel,
+        costs_island_home,
+        costs_activities,
+        costs_food,
+    )
+
+
+def render_login_gate() -> str | None:
+    """Zeigt eine eigenständige Login-Seite im Main-Bereich und liefert den aktiven Nutzernamen."""
+    if st.session_state.get("is_authenticated") and str(st.session_state.get("auth_user", "")).strip():
+        return str(st.session_state["auth_user"]).strip()
+
+    st.markdown("## Anmeldung")
+    st.caption("Bitte Namen eingeben, um deine gespeicherte Traumreise automatisch zu laden.")
+    st.info("Hinweis: Die Preise bei Unterkünften sind pro Nacht kalkuliert und werden in der Endrechnung durch die Anzahl der Personen geteilt.")
+
+    default_name = str(st.session_state.get("user_name", "")).strip()
+    with st.form("login_form", clear_on_submit=False):
+        login_name = st.text_input("Dein Name", value=default_name, placeholder="z. B. Robin")
+        submitted = st.form_submit_button("Weiter")
+
+    if submitted:
+        clean_name = str(login_name).strip()
+        if clean_name:
+            st.session_state["is_authenticated"] = True
+            st.session_state["auth_user"] = clean_name
+            st.session_state["user_name"] = clean_name
+            save_persisted_state()
+            st.rerun()
+        st.error("Bitte einen Namen eingeben.")
+
+    return None
+
+
+def main() -> None:
+    create_dummy_csv_files()
+    load_persisted_state()
+    df_unterkuenfte, df_aktivitaeten, df_transporte = load_csv_files()
+
+    df_unterkuenfte = ensure_columns(
+        df_unterkuenfte,
+        {
+            "Bild": "",
+            "Details": "",
+            "Vorteile": "",
+            "Nachteile": "",
+            "AirportTransfer": "Selbst",
+            "TransferKosten": 0,
+            "FruehstueckInklusive": "Nein",
+        },
+    )
+    df_unterkuenfte = attach_image_column(prepare_location_column(df_unterkuenfte), "unterkunft")
+
+    available_locations = sorted(df_unterkuenfte["StandortNorm"].dropna().astype(str).unique().tolist())
+    if not available_locations:
+        available_locations = ["Bangkok", "Ko Samui", "Phuket"]
+
+    df_aktivitaeten = ensure_columns(df_aktivitaeten, {"Bild": "", "Details": "", "Link": ""})
+    df_aktivitaeten = attach_image_column(prepare_location_column(df_aktivitaeten), "aktivitaet")
+
+    st.title("Thailand Reise Auto-Konfigurator")
+    st.caption("Karten markieren ohne Seitenwechsel. Fluege bleiben ohne Bildauswahl.")
+
+    user_name = render_login_gate()
+    if not user_name:
+        st.stop()
+
+    top_left, top_right = st.columns([4, 1])
+    with top_left:
+        st.caption(f"Angemeldet als: {user_name}")
+    with top_right:
+        if st.button("Abmelden", key="logout_main", use_container_width=True):
+            st.session_state["is_authenticated"] = False
+            st.session_state["auth_user"] = ""
+            st.session_state["_snapshot_loaded_for"] = None
+            save_persisted_state()
+            st.rerun()
+
+    # Bestimme Seitenliste: Statistik nur für Robin
+    st.sidebar.markdown("### Nutzer")
+    st.sidebar.write(f"Angemeldet als: **{user_name}**")
+    if st.sidebar.button("Abmelden", use_container_width=True):
+        st.session_state["is_authenticated"] = False
+        st.session_state["auth_user"] = ""
+        st.session_state["_snapshot_loaded_for"] = None
+        save_persisted_state()
+        st.rerun()
+
+    active_user_key = str(user_name).strip().lower()
+
+    seiten_liste = ["Konfigurator", "Übersicht Kosten", "Übersicht Auswahl", "Übersicht Infos"]
+    if active_user_key == "robin":
+        seiten_liste.append("Statistik")
+
+    page = st.sidebar.radio("Seiten", seiten_liste)
+
+    # Lade Snapshot ganz am Anfang, BEVOR Widgets erstellt werden
+    snapshot = None
+    if st.session_state.get("_snapshot_loaded_for") != active_user_key:
+        snapshot = load_user_snapshot(user_name)
+        if snapshot:
+            apply_snapshot_to_state(snapshot)
+            st.session_state["_snapshot_loaded_for"] = active_user_key
+            st.sidebar.success(f"✓ Gespeicherte Auswahl fuer '{user_name}' wiederhergestellt")
+            save_persisted_state()
+        else:
+            st.session_state["_snapshot_loaded_for"] = active_user_key
+
+    st.sidebar.markdown("### Schätzungen vor Ort")
+    num_travelers = int(
+        st.sidebar.number_input(
+            "Anzahl Reisende",
+            min_value=1,
+            max_value=50,
+            value=int(get_initial_value("num_travelers", 4, snapshot)),
+            step=1,
+            key="num_travelers",
+        )
+    )
+    days_bangkok = int(
+        st.sidebar.number_input(
+            "Tage Bangkok",
+            min_value=0,
+            max_value=30,
+            value=int(get_initial_value("days_bangkok", 3, snapshot)),
+            step=1,
+            key="days_bangkok",
+        )
+    )
+    days_island = int(
+        st.sidebar.number_input(
+            "Tage Insel",
+            min_value=0,
+            max_value=30,
+            value=int(get_initial_value("days_island", 7, snapshot)),
+            step=1,
+            key="days_island",
+        )
+    )
+    local_transport_per_day_pp = float(
+        st.sidebar.number_input(
+            "Transport vor Ort / Person / Tag",
+            min_value=0.0,
+            value=float(get_initial_value("local_transport_per_day_pp", 12.0, snapshot)),
+            step=1.0,
+            key="local_transport_per_day_pp",
+        )
+    )
+    food_per_day_pp = float(
+        st.sidebar.number_input(
+            "Verpflegung / Person / Tag",
+            min_value=0.0,
+            value=float(get_initial_value("food_per_day_pp", 30.0, snapshot)),
+            step=1.0,
+            key="food_per_day_pp",
+        )
+    )
+    breakfast_discount_per_day_pp = float(
+        st.sidebar.number_input(
+            "Abzug bei Fruehstueck inkl. / Person / Tag",
+            min_value=0.0,
+            value=float(get_initial_value("breakfast_discount_per_day_pp", 8.0, snapshot)),
+            step=1.0,
+            key="breakfast_discount_per_day_pp",
+        )
+    )
+
+
+    if active_user_key == "robin":
+        st.sidebar.markdown("### Admin")
+        admin_cmd = st.sidebar.text_input("Befehl", placeholder="download")
+        if admin_cmd.strip().lower() in {"download", "download_csv", "export"}:
+            if CSV_USER_SAVES.exists():
+                st.sidebar.download_button(
+                    "Speicherstände CSV herunterladen",
+                    data=CSV_USER_SAVES.read_bytes(),
+                    file_name="traumreisen_speicherstaende.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.sidebar.info("Noch keine Speicherstände vorhanden.")
+
+    flight_df = df_transporte[df_transporte["Typ"].astype(str).str.lower() == "flug"].copy()
+    flight_df["NameNorm"] = flight_df["Name"].map(normalize_text)
+    intl_df = flight_df[
+        flight_df["NameNorm"].str.contains("bangkok", na=False)
+        & ~flight_df["NameNorm"].str.contains("phuket|samui", na=False)
+    ]
+    if intl_df.empty:
+        intl_df = flight_df[flight_df["NameNorm"].str.contains("bangkok", na=False)]
+
+    bkk_hotels = df_unterkuenfte[df_unterkuenfte["StandortNorm"] == "Bangkok"]
+    # Robuster Filter: nimmt auch uneinheitliche CSV-Eintraege fuer Insel-Unterkuenfte mit.
+    island_homes = df_unterkuenfte[df_unterkuenfte.apply(is_island_accommodation, axis=1)]
+    bkk_activities = df_aktivitaeten[df_aktivitaeten["StandortNorm"] == "Bangkok"]
+
+    selected_flight_idx = _to_optional_int(st.session_state.get("sel_flight"))
+    selected_bkk_hotel_idx = _to_optional_int(st.session_state.get("sel_bkk_hotel"))
+    selected_island_home_idx = _to_optional_int(st.session_state.get("sel_island_home"))
+    selected_bkk_act_idx = _to_int_list(st.session_state.get("sel_bkk_act", []))
+    selected_island_act_idx = _to_int_list(st.session_state.get("sel_island_act", []))
+
+    # Bereinigte Werte zurückschreiben, damit Widgets und Persistenz identisch bleiben.
+    st.session_state["sel_flight"] = selected_flight_idx
+    st.session_state["sel_bkk_hotel"] = selected_bkk_hotel_idx
+    st.session_state["sel_island_home"] = selected_island_home_idx
+    st.session_state["sel_bkk_act"] = selected_bkk_act_idx
+    st.session_state["sel_island_act"] = selected_island_act_idx
+
+    selected_flight = intl_df.loc[selected_flight_idx] if selected_flight_idx in intl_df.index else None
+    selected_bkk_hotel = bkk_hotels.loc[selected_bkk_hotel_idx] if selected_bkk_hotel_idx in bkk_hotels.index else None
+    selected_island_home = (
+        island_homes.loc[selected_island_home_idx] if selected_island_home_idx in island_homes.index else None
+    )
+
+    destination = resolve_island_destination(selected_island_home)
+    domestic_flight = find_domestic_flight(df_transporte, destination) if destination else None
+
+    island_activities = pd.DataFrame(columns=df_aktivitaeten.columns)
+    if destination:
+        island_activities = df_aktivitaeten[df_aktivitaeten["StandortNorm"] == destination]
+
+    samui_activities = df_aktivitaeten[df_aktivitaeten["StandortNorm"] == "Ko Samui"]
+    phuket_activities = df_aktivitaeten[df_aktivitaeten["StandortNorm"] == "Phuket"]
+
+    selected_bkk_acts = bkk_activities[bkk_activities.index.isin(selected_bkk_act_idx)]
+    selected_island_acts = island_activities[island_activities.index.isin(selected_island_act_idx)]
+
+    (
+        per_person,
+        rows,
+        costs_flights,
+        costs_transport_other,
+        costs_accommodation,
+        costs_bkk_hotel,
+        costs_island_home,
+        costs_activities,
+        costs_food,
+    ) = calculate_summary(
+        selected_flight,
+        domestic_flight,
+        selected_bkk_hotel,
+        selected_island_home,
+        selected_bkk_acts,
+        selected_island_acts,
+        num_travelers,
+        days_bangkok,
+        days_island,
+        local_transport_per_day_pp,
+        food_per_day_pp,
+        breakfast_discount_per_day_pp,
+    )
+
+    # Auto-Snapshot je Nutzer: sorgt für Wiederherstellung bei Reload und auf anderen Geräten.
+    autosave_payload = normalize_state_payload({key: st.session_state.get(key) for key in PERSIST_KEYS})
+    autosave_record = {
+        "Zeitstempel": datetime.now().isoformat(timespec="seconds"),
+        "Name": user_name.strip(),
+        "StateJson": json.dumps(autosave_payload, ensure_ascii=True),
+        "Personen": num_travelers,
+        "TageBangkok": days_bangkok,
+        "TageInsel": days_island,
+        "FlugInternational": selected_flight["Name"] if selected_flight is not None else "",
+        "BangkokHotel": selected_bkk_hotel["Name"] if selected_bkk_hotel is not None else "",
+        "InselUnterkunft": selected_island_home["Name"] if selected_island_home is not None else "",
+        "InselZiel": destination or "",
+        "AktivitätenBangkok": selected_names(selected_bkk_acts),
+        "AktivitätenInsel": selected_names(selected_island_acts),
+        "KostenFluegePP": round(costs_flights, 2),
+        "KostenTransportSonstPP": round(costs_transport_other, 2),
+        "KostenHotelBangkokPP": round(costs_bkk_hotel, 2),
+        "KostenInselUnterkunftPP": round(costs_island_home, 2),
+        "KostenAktivitätenPP": round(costs_activities, 2),
+        "KostenVerpflegungPP": round(costs_food, 2),
+        "PreisProPerson": round(per_person, 2),
+    }
+    save_user_snapshot(autosave_record)
+
+    if page == "Konfigurator":
+        st.subheader("1) Flug nach Bangkok")
+        st.selectbox(
+            "Internationaler Flug",
+            options=intl_df.index.tolist(),
+            format_func=lambda idx: f"{intl_df.loc[idx, 'Name']} - {format_currency(float(intl_df.loc[idx, 'Kosten']))}",
+            key="sel_flight",
+            index=None if selected_flight_idx not in intl_df.index else intl_df.index.tolist().index(selected_flight_idx),
+            placeholder="Bitte Flug wählen",
+        )
+
+        st.subheader("2) Hotel in Bangkok")
+        image_select_grid(
+            bkk_hotels,
+            "bkk_hotel",
+            selected_bkk_hotel_idx,
+            False,
+            "Hotelbild anklicken",
+            info_mode="accommodation",
+        )
+
+        st.subheader("3) Aktivitäten in Bangkok")
+        image_select_grid(
+            bkk_activities,
+            "bkk_act",
+            selected_bkk_act_idx,
+            True,
+            "Mehrfachauswahl per Bildklick",
+            info_mode="activity",
+        )
+
+        st.subheader("4) Ferienwohnung auf der Insel")
+        image_select_grid(
+            island_homes,
+            "island_home",
+            selected_island_home_idx,
+            False,
+            "Ferienwohnung per Bildklick auswählen",
+            info_mode="accommodation",
+        )
+
+        st.subheader("5) Automatischer Inlandsflug")
+        if domestic_flight is None and destination:
+            st.warning(f"Kein passender Flug Bangkok -> {destination} gefunden.")
+        elif domestic_flight is not None:
+            st.success(
+                f"Auto-Flug: {domestic_flight['Name']} - {format_currency(float(domestic_flight['Kosten']))}"
+            )
+        else:
+            st.info("Wähle zuerst eine Ferienwohnung, dann wird der Inlandsflug automatisch gesucht.")
+
+        st.subheader("6) Aktivitäten auf der Insel")
+        if destination:
+            image_select_grid(
+                island_activities,
+                "island_act",
+                selected_island_act_idx,
+                True,
+                f"Aktivitäten in {destination}",
+                info_mode="activity",
+            )
+        else:
+            st.info("Sobald eine Ferienwohnung gewählt ist, erscheinen hier die Insel-Aktivitäten.")
+
+        st.subheader("7) Eigene Aktivitaet vorschlagen")
+        st.caption("Leere Felder bekommen automatisch sinnvolle Default-Werte. Robin kann Vorschläge freigeben oder ablehnen.")
+        with st.form("custom_activity_form", clear_on_submit=True):
+            ca1, ca2 = st.columns(2)
+            custom_name = ca1.text_input("Name der Aktivitaet")
+            custom_cost = ca2.number_input("Kosten pro Person", min_value=0.0, value=0.0, step=1.0)
+
+            cb1, cb2 = st.columns(2)
+            custom_location = cb1.selectbox("Standort", options=available_locations)
+            custom_link = cb2.text_input("Link (optional)", placeholder="https://...")
+
+            custom_details = st.text_area("Details", placeholder="Was ist wichtig? Dauer, Treffpunkt, Besonderheiten...")
+            custom_image = st.text_input("Bild-Link", placeholder="https://...jpg")
+            add_custom = st.form_submit_button("Aktivitaet zur Liste hinzufügen")
+
+        if add_custom:
+            new_activity = {
+                "Name": custom_name.strip() or "Eigene Aktivitaet",
+                "Kosten": float(custom_cost) if custom_cost is not None else 0.0,
+                "Standort": str(custom_location).strip() or "Bangkok",
+                "Link": custom_link.strip(),
+                "Bild": custom_image.strip(),
+                "Details": custom_details.strip() or "Keine Details angegeben",
+            }
+            submit_activity_suggestion(user_name, new_activity)
+            st.success("Vorschlag gespeichert. Robin kann ihn jetzt annehmen oder ablehnen.")
+            st.rerun()
+
+        my_open = list_open_suggestions_for_user(user_name)
+        if not my_open.empty:
+            st.markdown("**Deine offenen Vorschläge**")
+            st.dataframe(
+                my_open[["Zeitstempel", "Name", "Standort", "Kosten", "Details", "Link", "Bild"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("Du hast aktuell keine offenen Vorschläge.")
+
+        if active_user_key == "robin":
+            st.markdown("### Admin: Vorschläge prüfen")
+            pending = list_pending_suggestions()
+            if pending.empty:
+                st.caption("Keine offenen Vorschläge vorhanden.")
+            else:
+                for _, suggestion in pending.sort_values("Zeitstempel", ascending=False).iterrows():
+                    st.markdown(
+                        f"**{suggestion['Name']}** ({suggestion['Standort']}) - {format_currency(float(suggestion['Kosten'] or 0))}"
+                    )
+                    st.caption(f"Vorgeschlagen von: {suggestion['ProposedBy']} | {suggestion['Zeitstempel']}")
+                    st.write(str(suggestion.get("Details", "")).strip() or "Keine Details angegeben")
+                    if str(suggestion.get("Link", "")).strip():
+                        st.markdown(f"[Link öffnen]({str(suggestion['Link']).strip()})")
+                    if str(suggestion.get("Bild", "")).strip():
+                        st.caption(f"Bild: {str(suggestion['Bild']).strip()}")
+
+                    a1, a2 = st.columns(2)
+                    if a1.button("Annehmen", key=f"approve_{suggestion['SuggestionId']}", use_container_width=True):
+                        if review_suggestion(str(suggestion["SuggestionId"]), approved=True, reviewer=user_name):
+                            st.success("Vorschlag angenommen und global hinzugefügt.")
+                            st.rerun()
+                    if a2.button("Ablehnen", key=f"reject_{suggestion['SuggestionId']}", use_container_width=True):
+                        if review_suggestion(str(suggestion["SuggestionId"]), approved=False, reviewer=user_name):
+                            st.info("Vorschlag abgelehnt.")
+                            st.rerun()
+                    st.divider()
+
+        st.divider()
+        st.metric("Preis pro Person", format_currency(per_person))
+
+        st.markdown("### Traumreise speichern")
+        if st.button("Traumreise speichern", type="primary"):
+            state_payload = normalize_state_payload({key: st.session_state.get(key) for key in PERSIST_KEYS})
+            snapshot_record = {
+                "Zeitstempel": datetime.now().isoformat(timespec="seconds"),
+                "Name": user_name.strip(),
+                "StateJson": json.dumps(state_payload, ensure_ascii=True),
+                "Personen": num_travelers,
+                "TageBangkok": days_bangkok,
+                "TageInsel": days_island,
+                "FlugInternational": selected_flight["Name"] if selected_flight is not None else "",
+                "BangkokHotel": selected_bkk_hotel["Name"] if selected_bkk_hotel is not None else "",
+                "InselUnterkunft": selected_island_home["Name"] if selected_island_home is not None else "",
+                "InselZiel": destination or "",
+                "AktivitätenBangkok": selected_names(selected_bkk_acts),
+                "AktivitätenInsel": selected_names(selected_island_acts),
+                "KostenFlügePP": round(costs_flights, 2),
+                "KostenTransportSonstPP": round(costs_transport_other, 2),
+                "KostenHotelBangkokPP": round(costs_bkk_hotel, 2),
+                "KostenInselUnterkunftPP": round(costs_island_home, 2),
+                "KostenAktivitätenPP": round(costs_activities, 2),
+                "KostenVerpflegungPP": round(costs_food, 2),
+                "PreisProPerson": round(per_person, 2),
+            }
+            save_user_snapshot(snapshot_record)
+            st.success(f"Gespeichert für {user_name.strip()}.")
+
+    elif page == "Übersicht Kosten":
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Flüge pro Person", format_currency(costs_flights))
+        c2.metric("Transport sonstiges pro Person", format_currency(costs_transport_other))
+        c3.metric("Hotel Bangkok pro Person", format_currency(costs_bkk_hotel))
+        c4.metric("Insel-Unterkunft anteilig p.P.", format_currency(costs_island_home))
+        c5.metric("Aktivitäten pro Person", format_currency(costs_activities))
+        c6.metric("Verpflegung netto pro Person", format_currency(costs_food))
+        st.caption(f"Unterkünfte gesamt pro Person: {format_currency(costs_accommodation)}")
+        st.metric("Preis pro Person", format_currency(per_person))
+
+    elif page == "Übersicht Auswahl":
+        st.subheader("Auswahl-Liste")
+        if rows:
+            detail_df = pd.DataFrame(rows)
+            detail_df["Kosten"] = detail_df["Kosten"].map(format_currency)
+            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Noch keine Positionen ausgewählt.")
+
+    elif page == "Übersicht Infos":
+        st.subheader("Alle Unterkunftsinfos (read-only)")
+        st.markdown("**Bangkok Hotels**")
+        for _, row in bkk_hotels.iterrows():
+            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
+            render_accommodation_info(row)
+
+        st.markdown("**Ferienwohnungen Inseln**")
+        for _, row in island_homes.iterrows():
+            st.markdown(f"- **{row['Name']}** ({row['StandortNorm']}, {format_currency(float(row['Kosten']))})")
+            render_accommodation_info(row)
+
+        st.markdown("**Aktivitäten Bangkok**")
+        for _, row in bkk_activities.iterrows():
+            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
+            render_activity_info(row)
+
+        st.markdown("**Aktivitäten Ko Samui**")
+        for _, row in samui_activities.iterrows():
+            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
+            render_activity_info(row)
+
+        st.markdown("**Aktivitäten Phuket**")
+        for _, row in phuket_activities.iterrows():
+            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
+            render_activity_info(row)
+
+    elif page == "Statistik":
+        st.subheader("📊 Traumreisen Statistik")
+        if CSV_USER_SAVES.exists():
+            saves_df = pd.read_csv(CSV_USER_SAVES)
+            saves_df.columns = [str(col).strip() for col in saves_df.columns]
+            
+            # Grundstatistiken
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Gesamte Traumreisen gespeichert", len(saves_df))
+            col2.metric("Verschiedene Nutzer", saves_df["Name"].nunique())
+            col3.metric("Durchschn. Preis pro Person", format_currency(saves_df["PreisProPerson"].mean()))
+            col4.metric("Höchster Preis pro Person", format_currency(saves_df["PreisProPerson"].max()))
+            
+            st.divider()
+            
+            # Detaillierte Tabelle
+            st.markdown("### Alle Traumreisen")
+            display_df = saves_df[
+                ["Zeitstempel", "Name", "Personen", "TageBangkok", "TageInsel", 
+                 "BangkokHotel", "InselUnterkunft", "InselZiel", "PreisProPerson"]
+            ].copy()
+            display_df["PreisProPerson"] = display_df["PreisProPerson"].apply(format_currency)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            
+            st.divider()
+            
+            # Kostenverteilung
+            st.markdown("### Kostenverteilung pro Person (Durchschnitt)")
+            cost_cols = [
+                "KostenFlügePP",
+                "KostenTransportSonstPP", 
+                "KostenHotelBangkokPP",
+                "KostenInselUnterkunftPP",
+                "KostenAktivitätenPP",
+                "KostenVerpflegungPP"
+            ]
+            cost_labels = [
+                "Flüge",
+                "Transport sonstig",
+                "Hotel Bangkok",
+                "Insel-Unterkunft",
+                "Aktivitäten",
+                "Verpflegung"
+            ]
+            
+            avg_costs = saves_df[cost_cols].mean().values
+            
+            # Zeige Kosten als Metriken statt Balkendiagramm (robuster, keine Altair-Abhängigkeit)
+            cost_cols_ui = st.columns(3)
+            for idx, (label, cost) in enumerate(zip(cost_labels, avg_costs)):
+                with cost_cols_ui[idx % 3]:
+                    st.metric(label, format_currency(cost))
+            
+            st.divider()
+            
+            # Beliebte Hotels & Inseln
+            st.markdown("### Beliebte Destinationen")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Top Bangkok Hotels**")
+                bkk_top = saves_df["BangkokHotel"].value_counts().head(5)
+                for hotel, count in bkk_top.items():
+                    if hotel:
+                        st.write(f"• {hotel}: {count}x")
+            
+            with col2:
+                st.markdown("**Top Inseln**")
+                island_top = saves_df["InselZiel"].value_counts().head(5)
+                for island, count in island_top.items():
+                    if island:
+                        st.write(f"• {island}: {count}x")
+            
+        else:
+            st.info("Noch keine Traumreisen gespeichert.")
+
+    save_persisted_state()
+
+
+if __name__ == "__main__":
+    main()
+

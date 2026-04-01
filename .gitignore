@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/cache/
+
+# App-spezifisch (optional: Backup-CSVs nicht pushen)
+# Aber Basis-CSVs (aktivitaeten.csv, unterkuenfte.csv, transporte.csv) SOLLTEN gepusht werden!
+traumreisen_speicherstaende.csv
+traumreisen_submissions.csv
+aktivitaeten_vorschlaege.csv
+Unterkunft_sarah.csv
+
