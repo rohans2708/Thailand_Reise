@@ -7,7 +7,6 @@ import re
 import unicodedata
 from urllib.parse import quote
 from uuid import uuid4
-import os
 
 import pandas as pd
 import streamlit as st
@@ -27,6 +26,25 @@ try:
     SUPABASE_AVAILABLE = True
 except ImportError:
     SUPABASE_AVAILABLE = False
+
+@st.cache_resource
+def get_supabase_client() -> Client | None:
+    """Erstellt einen Supabase-Client mit Secrets aus Streamlit."""
+    if not SUPABASE_AVAILABLE:
+        return None
+    
+    url = st.secrets.get("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_ANON_KEY")
+    
+    if not url or not key:
+        # Im lokalen Modus ohne Secrets: auch None akzeptabel (Fallback auf CSV)
+        return None
+    
+    try:
+        return create_client(url, key)
+    except Exception as e:
+        st.warning(f"Supabase-Verbindung fehlgeschlagen: {e}")
+        return None
 
 BASE_DIR = Path(__file__).parent
 CSV_UNTERKUENFTE = BASE_DIR / "unterkuenfte.csv"
@@ -108,37 +126,73 @@ def append_submission(record: dict[str, object]) -> None:
 
 
 def save_user_snapshot(record: dict[str, object]) -> None:
-    """Speichert den aktuellen Stand je Name (letzter Stand gewinnt)."""
-    row = pd.DataFrame([record])
-    if CSV_USER_SAVES.exists():
-        existing = pd.read_csv(CSV_USER_SAVES)
-        existing.columns = [str(col).strip() for col in existing.columns]
-        existing = existing[existing["Name"].astype(str).str.lower() != str(record["Name"]).lower()]
-        merged = pd.concat([existing, row], ignore_index=True)
-        merged.to_csv(CSV_USER_SAVES, index=False)
-    else:
-        row.to_csv(CSV_USER_SAVES, index=False)
+    """Speichert Nutzer-Snapshot zu Supabase (primary storage)."""
+    client = get_supabase_client()
+    if not client:
+        st.warning("⚠️ Supabase nicht verbunden - Snapshot nicht gespeichert")
+        return
+    
+    # Konvertiere Record für Supabase
+    user_name = str(record.get("Name", "")).strip()
+    supabase_record = {
+        "user_name": user_name,
+        "created_at": record.get("Zeitstempel"),
+        "state_json": record.get("StateJson"),
+        "num_travelers": int(record.get("Personen", 1)),
+        "days_bangkok": int(record.get("TageBangkok", 0)),
+        "days_island": int(record.get("TageInsel", 0)),
+        "intl_flight": str(record.get("FlugInternational", "")).strip(),
+        "bkk_hotel": str(record.get("BangkokHotel", "")).strip(),
+        "island_accommodation": str(record.get("InselUnterkunft", "")).strip(),
+        "island_destination": str(record.get("InselZiel", "")).strip(),
+        "activities_bangkok": str(record.get("AktivitätenBangkok", "")).strip(),
+        "activities_island": str(record.get("AktivitätenInsel", "")).strip(),
+        "cost_flights": float(record.get("KostenFlügePP", 0)),
+        "cost_transport": float(record.get("KostenTransportSonstPP", 0)),
+        "cost_hotel": float(record.get("KostenHotelBangkokPP", 0)),
+        "cost_island": float(record.get("KostenInselUnterkunftPP", 0)),
+        "cost_activities": float(record.get("KostenAktivitätenPP", 0)),
+        "cost_food": float(record.get("KostenVerpflegungPP", 0)),
+        "total_per_person": float(record.get("PreisProPerson", 0)),
+    }
+    
+    try:
+        # Prüfe ob bereits vorhanden (upsert)
+        response = client.table("saved_travels").select("id").eq("user_name", user_name).execute()
+        if response.data:
+            # Update existing
+            client.table("saved_travels").update(supabase_record).eq("user_name", user_name).execute()
+        else:
+            # Insert new
+            client.table("saved_travels").insert(supabase_record).execute()
+    except Exception as e:
+        st.warning(f"⚠️ Snapshot-Fehler: {e}")
 
 
 def load_user_snapshot(user_name: str) -> dict[str, object] | None:
-    if not CSV_USER_SAVES.exists() or not str(user_name).strip():
+    """Lädt Nutzer-Snapshot aus Supabase (primary storage)."""
+    if not str(user_name).strip():
         return None
-    saved = pd.read_csv(CSV_USER_SAVES)
-    saved.columns = [str(col).strip() for col in saved.columns]
-    matches = saved[saved["Name"].astype(str).str.lower() == str(user_name).strip().lower()]
-    if matches.empty:
+    
+    client = get_supabase_client()
+    if not client:
+        st.warning("⚠️ Supabase nicht verbunden")
         return None
-    row = matches.sort_values("Zeitstempel", ascending=True).iloc[-1]
-    raw_state = str(row.get("StateJson", "")).strip()
-    if not raw_state:
-        return None
+    
     try:
-        payload = json.loads(raw_state)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return normalize_state_payload(payload)
+        response = client.table("saved_travels").select("*").eq("user_name", user_name.strip()).execute()
+        if response.data:
+            row = response.data[0]  # Nimm den neuesten (sollte nur 1 sein wegen UNIQUE)
+            if row.get("state_json"):
+                try:
+                    payload = json.loads(row["state_json"])
+                    return normalize_state_payload(payload)
+                except json.JSONDecodeError:
+                    return None
+    except Exception as e:
+        st.warning(f"⚠️ Fehler beim Laden: {e}")
+    
+    return None
 
 
 def get_initial_value(key: str, default: object, snapshot: dict[str, object] | None) -> object:
@@ -215,128 +269,239 @@ def normalize_state_payload(payload: dict[str, object] | None) -> dict[str, obje
 def _empty_suggestions_df() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
-            "SuggestionId",
-            "Zeitstempel",
-            "ProposedBy",
-            "Status",
-            "ReviewedBy",
-            "ReviewedAt",
-            "Name",
-            "Kosten",
-            "Standort",
-            "Link",
-            "Bild",
-            "Details",
+            "id",
+            "created_at",
+            "proposed_by",
+            "status",
+            "reviewed_by",
+            "reviewed_at",
+            "name",
+            "cost",
+            "location",
+            "link",
+            "image_url",
+            "details",
         ]
     )
 
 
-def load_activity_suggestions() -> pd.DataFrame:
-    if not CSV_ACTIVITY_SUGGESTIONS.exists():
+def _normalize_suggestions_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalisiert verschiedene Suggestion-Spaltennamen auf snake_case."""
+    if df.empty:
         return _empty_suggestions_df()
-    df = pd.read_csv(CSV_ACTIVITY_SUGGESTIONS)
-    df.columns = [str(col).strip() for col in df.columns]
-    for col in _empty_suggestions_df().columns:
-        if col not in df.columns:
-            df[col] = ""
-    df["SuggestionId"] = df["SuggestionId"].astype(str).str.strip()
-    df["Status"] = df["Status"].astype(str).str.strip().str.lower().replace({"": "pending"})
-    return df[_empty_suggestions_df().columns]
 
-
-def save_activity_suggestions(df: pd.DataFrame) -> None:
-    safe = df.copy()
-    safe.to_csv(CSV_ACTIVITY_SUGGESTIONS, index=False)
-
-
-def submit_activity_suggestion(user_name: str, payload: dict[str, object]) -> None:
-    df = load_activity_suggestions()
-    row = {
-        "SuggestionId": str(uuid4()),
-        "Zeitstempel": datetime.now().isoformat(timespec="seconds"),
-        "ProposedBy": str(user_name).strip(),
-        "Status": "pending",
-        "ReviewedBy": "",
-        "ReviewedAt": "",
-        "Name": str(payload.get("Name", "Eigene Aktivitaet")).strip() or "Eigene Aktivitaet",
-        "Kosten": float(payload.get("Kosten", 0) or 0),
-        "Standort": str(payload.get("Standort", "Bangkok")).strip() or "Bangkok",
-        "Link": str(payload.get("Link", "")).strip(),
-        "Bild": str(payload.get("Bild", "")).strip(),
-        "Details": str(payload.get("Details", "Keine Details angegeben")).strip() or "Keine Details angegeben",
+    mapped = df.copy()
+    rename_map = {
+        "SuggestionId": "id",
+        "Zeitstempel": "created_at",
+        "ProposedBy": "proposed_by",
+        "Status": "status",
+        "ReviewedBy": "reviewed_by",
+        "ReviewedAt": "reviewed_at",
+        "Name": "name",
+        "Kosten": "cost",
+        "Standort": "location",
+        "Link": "link",
+        "Bild": "image_url",
+        "Details": "details",
     }
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    save_activity_suggestions(df)
+    mapped = mapped.rename(columns=rename_map)
+
+    for col in _empty_suggestions_df().columns:
+        if col not in mapped.columns:
+            mapped[col] = ""
+
+    mapped["id"] = mapped["id"].astype(str).str.strip()
+    mapped["status"] = mapped["status"].astype(str).str.strip().str.lower().replace({"": "pending"})
+    return mapped[_empty_suggestions_df().columns]
+
+
+def load_activity_suggestions() -> pd.DataFrame:
+    """Lädt Activity Suggestions aus Supabase (primary). CSVs nur zum initialen Seeden."""
+    client = get_supabase_client()
+    
+    # IMMER versuchen, aus Supabase zu laden (das ist jetzt Primary Storage)
+    if client:
+        try:
+            response = client.table("activity_suggestions").select("*").execute()
+            if response.data:
+                return _normalize_suggestions_df_columns(pd.DataFrame(response.data))
+        except Exception as e:
+            # Wenn Tabelle nicht existiert: OK, initialisieren wir sie mit CSVs
+            st.info(f"ℹ️ Supabase-Tabelle noch nicht initialisiert: {str(e)[:100]}")
+    
+    # Fallback: Lies CSV (zum Initialisieren, nicht als Backup)
+    if CSV_ACTIVITY_SUGGESTIONS.exists():
+        df = pd.read_csv(CSV_ACTIVITY_SUGGESTIONS)
+        df.columns = [str(col).strip() for col in df.columns]
+        # Schreibe CSV-Daten zu Supabase (einmaliges Seeding)
+        _seed_activity_suggestions_to_supabase(df)
+        # Danach normalisiert zurückgeben (wichtig für Review/Approve-Flow)
+        return _normalize_suggestions_df_columns(df)
+    
+    return _empty_suggestions_df()
+
+
+def _seed_activity_suggestions_to_supabase(df: pd.DataFrame) -> None:
+    """Schreibt CSV-Aktivitätsvorschläge zu Supabase (einmalig)."""
+    client = get_supabase_client()
+    if not client or df.empty:
+        return
+    
+    try:
+        existing_rows = client.table("activity_suggestions").select("id").execute().data or []
+        existing_ids = {str(r.get("id", "")).strip() for r in existing_rows}
+
+        inserts: list[dict[str, object]] = []
+        for _, row in df.iterrows():
+            sid = str(row.get("SuggestionId", "")).strip()
+            if not sid:
+                sid = str(uuid4())
+            if sid in existing_ids:
+                continue
+
+            inserts.append(
+                {
+                    "id": sid,
+                    "created_at": str(row.get("Zeitstempel", datetime.now().isoformat())),
+                    "proposed_by": str(row.get("ProposedBy", "migration")).strip(),
+                    "status": str(row.get("Status", "pending")).strip().lower() or "pending",
+                    "reviewed_by": str(row.get("ReviewedBy", "")).strip(),
+                    "reviewed_at": str(row.get("ReviewedAt", "")).strip() or None,
+                    "name": str(row.get("Name", "")).strip(),
+                    "cost": float(row.get("Kosten", 0) or 0),
+                    "location": str(row.get("Standort", "")).strip(),
+                    "link": str(row.get("Link", "")).strip(),
+                    "image_url": str(row.get("Bild", "")).strip(),
+                    "details": str(row.get("Details", "")).strip(),
+                }
+            )
+            existing_ids.add(sid)
+
+        if inserts:
+            client.table("activity_suggestions").insert(inserts).execute()
+    except Exception as e:
+        st.warning(f"CSV-zu-Supabase Seeding fehlgeschlagen: {e}")
 
 
 def list_open_suggestions_for_user(user_name: str) -> pd.DataFrame:
+    """Listet offene Vorschläge des Nutzers aus Supabase auf."""
     df = load_activity_suggestions()
     if df.empty:
         return df
-    mask = (df["ProposedBy"].astype(str).str.lower() == str(user_name).strip().lower()) & (df["Status"] == "pending")
-    return df[mask].copy()
+    
+    # Spalten sind jetzt snake_case aus Supabase
+    try:
+        mask = (df["proposed_by"].astype(str).str.lower() == str(user_name).strip().lower()) & (df["status"].astype(str).str.lower() == "pending")
+        return df[mask].copy()
+    except KeyError:
+        # Falls Spalten nicht existieren
+        return pd.DataFrame()
 
 
 def list_pending_suggestions() -> pd.DataFrame:
+    """Listet alle offenen (pending) Suggestions aus Supabase auf."""
     df = load_activity_suggestions()
     if df.empty:
         return df
-    return df[df["Status"] == "pending"].copy()
+    
+    try:
+        return df[df["status"].astype(str).str.lower() == "pending"].copy()
+    except KeyError:
+        return pd.DataFrame()
 
 
-def _append_activity_to_catalog(activity: pd.Series) -> None:
-    base = pd.read_csv(CSV_AKTIVITAETEN)
-    base.columns = [str(col).strip() for col in base.columns]
-    base = ensure_columns(base, {"Link": "", "Bild": "", "Details": ""})
-
-    candidate_name = str(activity.get("Name", "")).strip()
-    candidate_loc = str(activity.get("Standort", "")).strip()
-    candidate_cost = float(activity.get("Kosten", 0) or 0)
-
-    duplicate_mask = (
-        base["Name"].astype(str).str.strip().str.lower().eq(candidate_name.lower())
-        & base["Standort"].astype(str).str.strip().str.lower().eq(candidate_loc.lower())
-        & pd.to_numeric(base["Kosten"], errors="coerce").fillna(0.0).round(2).eq(round(candidate_cost, 2))
-    )
-    if duplicate_mask.any():
+def submit_activity_suggestion(user_name: str, payload: dict[str, object]) -> None:
+    """Speichert Activity Suggestion zu Supabase (primary storage)."""
+    client = get_supabase_client()
+    if not client:
+        st.error("❌ Supabase nicht verbunden. Bitte Secrets prüfen.")
         return
-
-    new_row = {
-        "Name": candidate_name,
-        "Kosten": candidate_cost,
-        "Standort": candidate_loc,
-        "Link": str(activity.get("Link", "")).strip(),
-        "Bild": str(activity.get("Bild", "")).strip(),
-        "Details": str(activity.get("Details", "")).strip() or "Keine Details angegeben",
+    
+    row = {
+        "id": str(uuid4()),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "proposed_by": str(user_name).strip(),
+        "status": "pending",
+        "reviewed_by": "",
+        "reviewed_at": "",
+        "name": str(payload.get("Name", "Eigene Aktivitaet")).strip() or "Eigene Aktivitaet",
+        "cost": float(payload.get("Kosten", 0) or 0),
+        "location": str(payload.get("Standort", "Bangkok")).strip() or "Bangkok",
+        "link": str(payload.get("Link", "")).strip(),
+        "image_url": str(payload.get("Bild", "")).strip(),
+        "details": str(payload.get("Details", "Keine Details angegeben")).strip() or "Keine Details angegeben",
     }
-    base = pd.concat([base, pd.DataFrame([new_row])], ignore_index=True)
-    base.to_csv(CSV_AKTIVITAETEN, index=False)
+    
+    try:
+        client.table("activity_suggestions").insert(row).execute()
+    except Exception as e:
+        st.error(f"❌ Fehler beim Speichern: {e}")
 
 
 def review_suggestion(suggestion_id: str, approved: bool, reviewer: str) -> bool:
-    df = load_activity_suggestions()
-    if df.empty:
+    """Akzeptiert oder lehnt Suggestion ab (Supabase primary)."""
+    client = get_supabase_client()
+    if not client:
+        st.error("❌ Supabase nicht verbunden.")
+        return False
+    
+    try:
+        # Update suggestion status
+        update_data = {
+            "status": "approved" if approved else "rejected",
+            "reviewed_by": str(reviewer).strip(),
+            "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        
+        client.table("activity_suggestions").update(update_data).eq("id", suggestion_id).execute()
+        
+        # If approved: add to aktivitaeten catalog
+        if approved:
+            df = load_activity_suggestions()
+            match = df[df["id"].astype(str) == str(suggestion_id)]
+            if not match.empty:
+                row = match.iloc[0]
+                _append_activity_to_catalog(row.to_dict())
+        
+        return True
+    except Exception as e:
+        st.error(f"❌ Fehler beim Review: {e}")
         return False
 
-    sid = str(suggestion_id).strip()
-    matches = df.index[df["SuggestionId"].astype(str).str.strip() == sid].tolist()
-    if not matches:
+
+def _append_activity_to_catalog(activity: dict[str, object]) -> bool:
+    """Fügt eine genehmigte Aktivität in den Supabase-Katalog ein (duplikatsicher)."""
+    client = get_supabase_client()
+    if not client:
         return False
 
-    idx = matches[0]
-    if str(df.at[idx, "Status"]).strip().lower() != "pending":
+    # Unterstützt sowohl snake_case (Supabase) als auch Legacy-Spaltennamen.
+    name = str(activity.get("name") or activity.get("Name") or "").strip()
+    location = str(activity.get("location") or activity.get("Standort") or "").strip()
+    cost = float(activity.get("cost") or activity.get("Kosten") or 0)
+    link = str(activity.get("link") or activity.get("Link") or "").strip()
+
+    if not name or not location:
         return False
 
-    if approved:
-        _append_activity_to_catalog(df.loc[idx])
-        df.at[idx, "Status"] = "approved"
-    else:
-        df.at[idx, "Status"] = "rejected"
+    try:
+        existing = client.table("aktivitaeten").select("id").eq("name", name).eq("location", location).eq("cost", cost).eq("link", link).execute()
+        if existing.data:
+            return True
 
-    df.at[idx, "ReviewedBy"] = str(reviewer).strip()
-    df.at[idx, "ReviewedAt"] = datetime.now().isoformat(timespec="seconds")
-    save_activity_suggestions(df)
-    return True
+        row = {
+            "name": name,
+            "cost": cost,
+            "location": location,
+            "link": link,
+            "image_url": str(activity.get("image_url") or activity.get("Bild") or "").strip(),
+            "details": str(activity.get("details") or activity.get("Details") or "").strip() or "Keine Details angegeben",
+        }
+        client.table("aktivitaeten").insert(row).execute()
+        return True
+    except Exception:
+        return False
 
 
 def apply_snapshot_to_state(payload: dict[str, object] | None) -> None:
@@ -451,6 +616,249 @@ def create_dummy_csv_files() -> None:
         ).to_csv(CSV_TRANSPORTE, index=False)
 
 
+def _read_clean_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = [str(col).strip() for col in df.columns]
+    return df
+
+
+def _norm_seed_text(value: object) -> str:
+    """Normalisiert Seed-Texte robust fuer Duplikat-Pruefung."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan"}:
+        return ""
+    return normalize_text(text)
+
+
+def _norm_seed_float(value: object) -> float:
+    """Normalisiert Seed-Floats robust fuer Duplikat-Pruefung."""
+    try:
+        return round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _seed_unterkuenfte_to_supabase_from_csv(client: Client) -> None:
+    if not CSV_UNTERKUENFTE.exists():
+        return
+
+    csv_df = ensure_columns(
+        _read_clean_csv(CSV_UNTERKUENFTE),
+        {
+            "Link": "",
+            "Bild": "",
+            "Details": "",
+            "Vorteile": "",
+            "Nachteile": "",
+            "AirportTransfer": "Selbst",
+            "TransferKosten": 0,
+            "FruehstueckInklusive": "Nein",
+        },
+    )
+
+    try:
+        existing_rows = client.table("unterkuenfte").select("name,location,cost,link").execute().data or []
+        existing_keys = {
+            (
+                _norm_seed_text(r.get("name", "")),
+                _norm_seed_text(r.get("location", "")),
+                _norm_seed_float(r.get("cost", 0)),
+                _norm_seed_text(r.get("link", "")),
+            )
+            for r in existing_rows
+        }
+
+        inserts: list[dict[str, object]] = []
+        seen_csv_keys: set[tuple[str, str, float, str]] = set()
+        for _, row in csv_df.iterrows():
+            key = (
+                _norm_seed_text(row.get("Name", "")),
+                _norm_seed_text(row.get("Standort", "")),
+                _norm_seed_float(row.get("Kosten", 0)),
+                _norm_seed_text(row.get("Link", "")),
+            )
+            if key in existing_keys or key in seen_csv_keys:
+                continue
+            seen_csv_keys.add(key)
+            existing_keys.add(key)
+
+            inserts.append(
+                {
+                    "name": str(row.get("Name", "")).strip(),
+                    "cost": float(row.get("Kosten", 0) or 0),
+                    "location": str(row.get("Standort", "")).strip(),
+                    "link": str(row.get("Link", "")).strip(),
+                    "image_url": str(row.get("Bild", "")).strip(),
+                    "details": str(row.get("Details", "")).strip(),
+                    "advantages": str(row.get("Vorteile", "")).strip(),
+                    "disadvantages": str(row.get("Nachteile", "")).strip(),
+                    "airport_transfer": str(row.get("AirportTransfer", "Selbst")).strip() or "Selbst",
+                    "transfer_cost": float(row.get("TransferKosten", 0) or 0),
+                    "breakfast_included": str(row.get("FruehstueckInklusive", "Nein")).strip() or "Nein",
+                }
+            )
+
+        if inserts:
+            client.table("unterkuenfte").insert(inserts).execute()
+    except Exception as e:
+        st.warning(f"Seed Unterkuenfte fehlgeschlagen: {e}")
+
+
+def _seed_transporte_to_supabase_from_csv(client: Client) -> None:
+    if not CSV_TRANSPORTE.exists():
+        return
+
+    csv_df = _read_clean_csv(CSV_TRANSPORTE)
+    try:
+        existing_rows = client.table("transporte").select("name,type,cost").execute().data or []
+        existing_keys = {
+            (
+                _norm_seed_text(r.get("name", "")),
+                _norm_seed_text(r.get("type", "")),
+                _norm_seed_float(r.get("cost", 0)),
+            )
+            for r in existing_rows
+        }
+
+        inserts: list[dict[str, object]] = []
+        seen_csv_keys: set[tuple[str, str, float]] = set()
+        for _, row in csv_df.iterrows():
+            key = (
+                _norm_seed_text(row.get("Name", "")),
+                _norm_seed_text(row.get("Typ", "")),
+                _norm_seed_float(row.get("Kosten", 0)),
+            )
+            if key in existing_keys or key in seen_csv_keys:
+                continue
+            seen_csv_keys.add(key)
+            existing_keys.add(key)
+
+            inserts.append(
+                {
+                    "name": str(row.get("Name", "")).strip(),
+                    "cost": float(row.get("Kosten", 0) or 0),
+                    "type": str(row.get("Typ", "")).strip(),
+                }
+            )
+
+        if inserts:
+            client.table("transporte").insert(inserts).execute()
+    except Exception as e:
+        st.warning(f"Seed Transporte fehlgeschlagen: {e}")
+
+
+def _seed_aktivitaeten_to_supabase_from_csv(client: Client) -> None:
+    if not CSV_AKTIVITAETEN.exists():
+        return
+
+    csv_df = ensure_columns(_read_clean_csv(CSV_AKTIVITAETEN), {"Link": "", "Bild": "", "Details": ""})
+    try:
+        existing_rows = client.table("aktivitaeten").select("name,location,cost,link").execute().data or []
+        existing_keys = {
+            (
+                _norm_seed_text(r.get("name", "")),
+                _norm_seed_text(r.get("location", "")),
+                _norm_seed_float(r.get("cost", 0)),
+                _norm_seed_text(r.get("link", "")),
+            )
+            for r in existing_rows
+        }
+
+        inserts: list[dict[str, object]] = []
+        seen_csv_keys: set[tuple[str, str, float, str]] = set()
+
+        for _, row in csv_df.iterrows():
+            key = (
+                _norm_seed_text(row.get("Name", "")),
+                _norm_seed_text(row.get("Standort", "")),
+                _norm_seed_float(row.get("Kosten", 0)),
+                _norm_seed_text(row.get("Link", "")),
+            )
+            if key in existing_keys or key in seen_csv_keys:
+                continue
+
+            seen_csv_keys.add(key)
+            existing_keys.add(key)
+
+            inserts.append(
+                {
+                    "name": str(row.get("Name", "")).strip(),
+                    "cost": float(row.get("Kosten", 0) or 0),
+                    "location": str(row.get("Standort", "")).strip(),
+                    "link": str(row.get("Link", "")).strip(),
+                    "image_url": str(row.get("Bild", "")).strip(),
+                    "details": str(row.get("Details", "")).strip(),
+                }
+            )
+
+        if inserts:
+            client.table("aktivitaeten").insert(inserts).execute()
+    except Exception as e:
+        st.warning(f"Seed Aktivitaeten fehlgeschlagen: {e}")
+
+
+def _load_unterkuenfte_from_supabase(client: Client) -> pd.DataFrame:
+    _seed_unterkuenfte_to_supabase_from_csv(client)
+    response = client.table("unterkuenfte").select("*").execute()
+    rows = response.data or []
+    if not rows:
+        return pd.DataFrame(columns=["Name", "Kosten", "Standort", "Link", "Bild", "Details", "Vorteile", "Nachteile", "AirportTransfer", "TransferKosten", "FruehstueckInklusive"])
+
+    mapped = pd.DataFrame(
+        {
+            "Name": [str(r.get("name", "")) for r in rows],
+            "Kosten": [float(r.get("cost", 0) or 0) for r in rows],
+            "Standort": [str(r.get("location", "")) for r in rows],
+            "Link": [str(r.get("link", "")) for r in rows],
+            "Bild": [str(r.get("image_url", "")) for r in rows],
+            "Details": [str(r.get("details", "")) for r in rows],
+            "Vorteile": [str(r.get("advantages", "")) for r in rows],
+            "Nachteile": [str(r.get("disadvantages", "")) for r in rows],
+            "AirportTransfer": [str(r.get("airport_transfer", "Selbst")) for r in rows],
+            "TransferKosten": [float(r.get("transfer_cost", 0) or 0) for r in rows],
+            "FruehstueckInklusive": [str(r.get("breakfast_included", "Nein")) for r in rows],
+        }
+    )
+    return mapped
+
+
+def _load_transporte_from_supabase(client: Client) -> pd.DataFrame:
+    _seed_transporte_to_supabase_from_csv(client)
+    response = client.table("transporte").select("*").execute()
+    rows = response.data or []
+    if not rows:
+        return pd.DataFrame(columns=["Name", "Kosten", "Typ"])
+
+    return pd.DataFrame(
+        {
+            "Name": [str(r.get("name", "")) for r in rows],
+            "Kosten": [float(r.get("cost", 0) or 0) for r in rows],
+            "Typ": [str(r.get("type", "")) for r in rows],
+        }
+    )
+
+
+def _load_aktivitaeten_from_supabase(client: Client) -> pd.DataFrame:
+    _seed_aktivitaeten_to_supabase_from_csv(client)
+    response = client.table("aktivitaeten").select("*").execute()
+    rows = response.data or []
+    if not rows:
+        return pd.DataFrame(columns=["Name", "Kosten", "Standort", "Link", "Bild", "Details"])
+
+    return pd.DataFrame(
+        {
+            "Name": [str(r.get("name", "")) for r in rows],
+            "Kosten": [float(r.get("cost", 0) or 0) for r in rows],
+            "Standort": [str(r.get("location", "")) for r in rows],
+            "Link": [str(r.get("link", "")) for r in rows],
+            "Bild": [str(r.get("image_url", "")) for r in rows],
+            "Details": [str(r.get("details", "")) for r in rows],
+        }
+    )
+
+
 def load_csv_files() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     def _read_clean(path: Path) -> pd.DataFrame:
         df = pd.read_csv(path)
@@ -458,7 +866,16 @@ def load_csv_files() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         df.columns = [str(col).strip() for col in df.columns]
         return df
 
-    return _read_clean(CSV_UNTERKUENFTE), _read_clean(CSV_AKTIVITAETEN), _read_clean(CSV_TRANSPORTE)
+    client = get_supabase_client()
+    if client is None:
+        st.error("Supabase nicht verfügbar. Bitte SUPABASE_URL und SUPABASE_ANON_KEY prüfen.")
+        st.stop()
+
+    # Katalogdaten: Supabase primary, CSV nur als Seed
+    unterkuenfte_df = _load_unterkuenfte_from_supabase(client)
+    transporte_df = _load_transporte_from_supabase(client)
+    aktivitaeten_df = _load_aktivitaeten_from_supabase(client)
+    return unterkuenfte_df, aktivitaeten_df, transporte_df
 
 
 def ensure_columns(df: pd.DataFrame, defaults: dict[str, object]) -> pd.DataFrame:
@@ -529,7 +946,7 @@ def find_domestic_flight(transporte_df: pd.DataFrame, destination: str) -> pd.Se
         return None
     if destination not in {"Phuket", "Ko Samui"}:
         return None
-    flights["NameNorm"] = flights["Name"].map(normalize_text)
+    flights.loc[:, "NameNorm"] = flights["Name"].map(normalize_text)
     dest_keys = ["phuket"] if destination == "Phuket" else ["ko samui", "koh samui", "samui"]
     matches = flights[
         flights["NameNorm"].str.contains("bangkok", na=False)
@@ -949,7 +1366,7 @@ def main() -> None:
                 st.sidebar.download_button(
                     "Speicherstände CSV herunterladen",
                     data=CSV_USER_SAVES.read_bytes(),
-                    file_name="traumreisen_speicherstaende.csv",
+                    file_name="init_data/traumreisen_speicherstaende.csv",
                     mime="text/csv",
                 )
             else:
@@ -987,7 +1404,7 @@ def main() -> None:
                 )
 
     flight_df = df_transporte[df_transporte["Typ"].astype(str).str.lower() == "flug"].copy()
-    flight_df["NameNorm"] = flight_df["Name"].map(normalize_text)
+    flight_df.loc[:, "NameNorm"] = flight_df["Name"].map(normalize_text)
     intl_df = flight_df[
         flight_df["NameNorm"].str.contains("bangkok", na=False)
         & ~flight_df["NameNorm"].str.contains("phuket|samui", na=False)

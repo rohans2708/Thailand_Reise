@@ -23,10 +23,8 @@ Thumbs.db
 .streamlit/secrets.toml
 .streamlit/cache/
 
-# App-spezifisch (optional: Backup-CSVs nicht pushen)
-# Aber Basis-CSVs (aktivitaeten.csv, unterkuenfte.csv, transporte.csv) SOLLTEN gepusht werden!
-traumreisen_speicherstaende.csv
-traumreisen_submissions.csv
-aktivitaeten_vorschlaege.csv
-Unterkunft_sarah.csv
+# Content-Dateien: alles aus Git, außer README.md
+*.csv
+*.md
+!README.md
 
