@@ -1867,13 +1867,31 @@ def main() -> None:
             saves_df.columns = [str(col).strip() for col in saves_df.columns]
 
         if not saves_df.empty:
+            # Robuste Defaults, damit ältere Datenstände/abweichende Spaltennamen keine KeyErrors auslösen.
+            required_display_cols = [
+                "Zeitstempel",
+                "Name",
+                "Personen",
+                "TageBangkok",
+                "TageInsel",
+                "BangkokHotel",
+                "InselUnterkunft",
+                "InselZiel",
+                "PreisProPerson",
+            ]
+            for col in required_display_cols:
+                if col not in saves_df.columns:
+                    saves_df[col] = "" if col not in {"Personen", "PreisProPerson"} else 0
+
             for num_col in [
                 "PreisProPerson",
                 "KostenFluegePP",
+                "KostenFlügePP",
                 "KostenTransportSonstPP",
                 "KostenHotelBangkokPP",
                 "KostenInselUnterkunftPP",
                 "KostenAktivitätenPP",
+                "KostenAktivitaetenPP",
                 "KostenVerpflegungPP",
             ]:
                 if num_col in saves_df.columns:
@@ -1906,28 +1924,28 @@ def main() -> None:
             
             # Kostenverteilung
             st.markdown("### Kostenverteilung pro Person (Durchschnitt)")
-            cost_cols = [
-                "KostenFlügePP",
-                "KostenTransportSonstPP", 
-                "KostenHotelBangkokPP",
-                "KostenInselUnterkunftPP",
-                "KostenAktivitätenPP",
-                "KostenVerpflegungPP"
+            cost_aliases = [
+                ("Flüge", ["KostenFluegePP", "KostenFlügePP"]),
+                ("Transport sonstig", ["KostenTransportSonstPP"]),
+                ("Hotel Bangkok", ["KostenHotelBangkokPP"]),
+                ("Insel-Unterkunft", ["KostenInselUnterkunftPP"]),
+                ("Aktivitäten", ["KostenAktivitätenPP", "KostenAktivitaetenPP"]),
+                ("Verpflegung", ["KostenVerpflegungPP"]),
             ]
-            cost_labels = [
-                "Flüge",
-                "Transport sonstig",
-                "Hotel Bangkok",
-                "Insel-Unterkunft",
-                "Aktivitäten",
-                "Verpflegung"
-            ]
-            
-            avg_costs = saves_df[cost_cols].mean().values
+
+            avg_cost_items: list[tuple[str, float]] = []
+            for label, aliases in cost_aliases:
+                series = None
+                for alias in aliases:
+                    if alias in saves_df.columns:
+                        series = pd.to_numeric(saves_df[alias], errors="coerce").fillna(0.0)
+                        break
+                avg_val = float(series.mean()) if series is not None else 0.0
+                avg_cost_items.append((label, avg_val))
             
             # Zeige Kosten als Metriken statt Balkendiagramm (robuster, keine Altair-Abhängigkeit)
             cost_cols_ui = st.columns(3)
-            for idx, (label, cost) in enumerate(zip(cost_labels, avg_costs)):
+            for idx, (label, cost) in enumerate(avg_cost_items):
                 with cost_cols_ui[idx % 3]:
                     st.metric(label, format_currency(cost))
             
