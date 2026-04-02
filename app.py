@@ -569,6 +569,24 @@ def add_transport_to_supabase(payload: dict[str, object]) -> tuple[bool, str]:
         return False, f"Fehler: {e}"
 
 
+def build_flight_transport_name(
+    von: str,
+    nach: str,
+    flugzeit_hin: str,
+    flugzeit_zurueck: str,
+    zwischenstop_ort: str,
+    sonstiges: str,
+) -> str:
+    """Baut den Transport-Namen fuer Flug-Eintraege konsistent zusammen."""
+    return (
+        f"Flug ({von} - {nach}); "
+        f"Flugzeit hin: {flugzeit_hin}; "
+        f"Flugzeit zurück: {flugzeit_zurueck}; "
+        f"Zwischenstop Ort: {zwischenstop_ort}; "
+        f"Sonstiges: {sonstiges}"
+    )
+
+
 def apply_snapshot_to_state(payload: dict[str, object] | None) -> None:
     """Übernimmt gespeicherte Werte in den Session-State (ohne user_name zu überschreiben)."""
     if not payload:
@@ -1735,21 +1753,59 @@ def main() -> None:
                 t_name = t1.text_input("Transport-Name")
                 t_cost = t2.number_input("Kosten", min_value=0.0, value=0.0, step=1.0)
                 t_type = st.selectbox("Typ", options=["Flug", "Fähre", "Bus", "Zug", "Taxi", "Sonstiges"])
+
+                t_von = ""
+                t_nach = ""
+                t_flugzeit_hin = ""
+                t_flugzeit_zurueck = ""
+                t_zwischenstop_ort = ""
+                t_sonstiges = ""
+                if t_type == "Flug":
+                    f1, f2 = st.columns(2)
+                    t_von = f1.text_input("von")
+                    t_nach = f2.text_input("nach")
+
+                    f3, f4 = st.columns(2)
+                    t_flugzeit_hin = f3.text_input("Flugzeit hin")
+                    t_flugzeit_zurueck = f4.text_input("Flugzeit zurück")
+
+                    f5, f6 = st.columns(2)
+                    t_zwischenstop_ort = f5.text_input("Zwischenstop Ort")
+                    t_sonstiges = f6.text_input("Sonstiges")
+
                 submit_t = st.form_submit_button("Transport hinzufügen")
 
             if submit_t:
-                success, msg = add_transport_to_supabase(
-                    {
-                        "name": t_name.strip(),
-                        "cost": float(t_cost),
-                        "type": t_type,
-                    }
-                )
-                if success:
-                    st.success(msg)
-                    st.rerun()
+                final_transport_name = t_name.strip()
+                if t_type == "Flug":
+                    if not t_von.strip() or not t_nach.strip():
+                        st.error("Für Flug bitte mindestens 'von' und 'nach' angeben.")
+                        final_transport_name = ""
+                    else:
+                        final_transport_name = build_flight_transport_name(
+                            von=t_von.strip(),
+                            nach=t_nach.strip(),
+                            flugzeit_hin=t_flugzeit_hin.strip() or "k. A.",
+                            flugzeit_zurueck=t_flugzeit_zurueck.strip() or "k. A.",
+                            zwischenstop_ort=t_zwischenstop_ort.strip() or "kein",
+                            sonstiges=t_sonstiges.strip() or "-",
+                        )
+
+                if not final_transport_name:
+                    pass
                 else:
-                    st.error(msg)
+                    success, msg = add_transport_to_supabase(
+                        {
+                            "name": final_transport_name,
+                            "cost": float(t_cost),
+                            "type": t_type,
+                        }
+                    )
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
     elif page == "Statistik":
         st.subheader("📊 Traumreisen Statistik")
