@@ -1274,7 +1274,7 @@ def main() -> None:
 
     active_user_key = str(user_name).strip().lower()
 
-    seiten_liste = ["Konfigurator", "Übersicht Kosten", "Übersicht Auswahl", "Übersicht Infos"]
+    seiten_liste = ["Konfigurator", "Übersicht Kosten", "Übersicht Auswahl"]
     admin_data_users = {"robin", "sarh", "sarah"}
     if active_user_key in admin_data_users:
         seiten_liste.append("Unterkunft/Transport hinzufügen")
@@ -1677,32 +1677,6 @@ def main() -> None:
         else:
             st.info("Noch keine Positionen ausgewählt.")
 
-    elif page == "Übersicht Infos":
-        st.subheader("Alle Unterkunftsinfos (read-only)")
-        st.markdown("**Bangkok Hotels**")
-        for _, row in bkk_hotels.iterrows():
-            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
-            render_accommodation_info(row)
-
-        st.markdown("**Ferienwohnungen Inseln**")
-        for _, row in island_homes.iterrows():
-            st.markdown(f"- **{row['Name']}** ({row['StandortNorm']}, {format_currency(float(row['Kosten']))})")
-            render_accommodation_info(row)
-
-        st.markdown("**Aktivitäten Bangkok**")
-        for _, row in bkk_activities.iterrows():
-            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
-            render_activity_info(row)
-
-        st.markdown("**Aktivitäten Ko Samui**")
-        for _, row in samui_activities.iterrows():
-            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
-            render_activity_info(row)
-
-        st.markdown("**Aktivitäten Phuket**")
-        for _, row in phuket_activities.iterrows():
-            st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
-            render_activity_info(row)
 
     elif page == "Unterkunft/Transport hinzufügen":
         st.subheader("Neue Unterkunft oder neuen Transport hinzufügen")
