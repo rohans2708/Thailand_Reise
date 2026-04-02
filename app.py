@@ -790,7 +790,8 @@ def _seed_aktivitaeten_to_supabase_from_csv(client: Client) -> None:
                     "cost": float(row.get("Kosten", 0) or 0),
                     "location": str(row.get("Standort", "")).strip(),
                     "link": str(row.get("Link", "")).strip(),
-                    "image_url": str(row.get("Bild", "")).strip(),
+                    # Sicherheitsmodus: keine Bilder aus CSV nach Supabase uebernehmen
+                    "image_url": "",
                     "details": str(row.get("Details", "")).strip(),
                 }
             )
