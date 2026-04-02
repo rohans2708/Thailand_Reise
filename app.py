@@ -427,8 +427,8 @@ def submit_activity_suggestion(user_name: str, payload: dict[str, object]) -> No
         "proposed_by": str(user_name).strip(),
         "status": "pending",
         "reviewed_by": "",
-        "reviewed_at": "",
-        "name": str(payload.get("Name", "Eigene Aktivitaet")).strip() or "Eigene Aktivitaet",
+        "reviewed_at": None,
+        "name": str(payload.get("Name", "Eigene Aktivität")).strip() or "Eigene Aktivitaet",
         "cost": float(payload.get("Kosten", 0) or 0),
         "location": str(payload.get("Standort", "Bangkok")).strip() or "Bangkok",
         "link": str(payload.get("Link", "")).strip(),
@@ -505,6 +505,68 @@ def _append_activity_to_catalog(activity: dict[str, object]) -> bool:
         return True
     except Exception:
         return False
+
+
+def add_unterkunft_to_supabase(payload: dict[str, object]) -> tuple[bool, str]:
+    """Fügt eine Unterkunft in Supabase ein (duplikatsicher)."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase nicht verbunden."
+
+    name = str(payload.get("name", "")).strip()
+    location = str(payload.get("location", "")).strip()
+    cost = float(payload.get("cost", 0) or 0)
+    link = str(payload.get("link", "")).strip()
+    if not name or not location:
+        return False, "Name und Standort sind Pflichtfelder."
+
+    try:
+        existing = (
+            client.table("unterkuenfte")
+            .select("id")
+            .eq("name", name)
+            .eq("location", location)
+            .eq("cost", cost)
+            .eq("link", link)
+            .execute()
+        )
+        if existing.data:
+            return False, "Unterkunft existiert bereits."
+
+        client.table("unterkuenfte").insert(payload).execute()
+        return True, "Unterkunft hinzugefügt."
+    except Exception as e:
+        return False, f"Fehler: {e}"
+
+
+def add_transport_to_supabase(payload: dict[str, object]) -> tuple[bool, str]:
+    """Fügt einen Transport in Supabase ein (duplikatsicher)."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase nicht verbunden."
+
+    name = str(payload.get("name", "")).strip()
+    transport_type = str(payload.get("type", "")).strip()
+    cost = float(payload.get("cost", 0) or 0)
+    if not name or not transport_type:
+        return False, "Name und Typ sind Pflichtfelder."
+
+    try:
+        existing = (
+            client.table("transporte")
+            .select("id")
+            .eq("name", name)
+            .eq("type", transport_type)
+            .eq("cost", cost)
+            .execute()
+        )
+        if existing.data:
+            return False, "Transport existiert bereits."
+
+        client.table("transporte").insert(payload).execute()
+        return True, "Transport hinzugefügt."
+    except Exception as e:
+        return False, f"Fehler: {e}"
 
 
 def apply_snapshot_to_state(payload: dict[str, object] | None) -> None:
@@ -1213,6 +1275,9 @@ def main() -> None:
     active_user_key = str(user_name).strip().lower()
 
     seiten_liste = ["Konfigurator", "Übersicht Kosten", "Übersicht Auswahl", "Übersicht Infos"]
+    admin_data_users = {"robin", "sarh", "sarah"}
+    if active_user_key in admin_data_users:
+        seiten_liste.append("Unterkunft/Transport hinzufügen")
     if active_user_key == "robin":
         seiten_liste.append("Statistik")
 
@@ -1527,7 +1592,7 @@ def main() -> None:
         if not my_open.empty:
             st.markdown("**Deine offenen Vorschläge**")
             st.dataframe(
-                my_open[["Zeitstempel", "Name", "Standort", "Kosten", "Details", "Link", "Bild"]],
+                my_open[["created_at", "name", "location", "cost", "details", "link", "image_url"]],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -1540,24 +1605,24 @@ def main() -> None:
             if pending.empty:
                 st.caption("Keine offenen Vorschläge vorhanden.")
             else:
-                for _, suggestion in pending.sort_values("Zeitstempel", ascending=False).iterrows():
+                for _, suggestion in pending.sort_values("created_at", ascending=False).iterrows():
                     st.markdown(
-                        f"**{suggestion['Name']}** ({suggestion['Standort']}) - {format_currency(float(suggestion['Kosten'] or 0))}"
+                        f"**{suggestion['name']}** ({suggestion['location']}) - {format_currency(float(suggestion['cost'] or 0))}"
                     )
-                    st.caption(f"Vorgeschlagen von: {suggestion['ProposedBy']} | {suggestion['Zeitstempel']}")
-                    st.write(str(suggestion.get("Details", "")).strip() or "Keine Details angegeben")
-                    if str(suggestion.get("Link", "")).strip():
-                        st.markdown(f"[Link öffnen]({str(suggestion['Link']).strip()})")
-                    if str(suggestion.get("Bild", "")).strip():
-                        st.caption(f"Bild: {str(suggestion['Bild']).strip()}")
+                    st.caption(f"Vorgeschlagen von: {suggestion['proposed_by']} | {suggestion['created_at']}")
+                    st.write(str(suggestion.get("details", "")).strip() or "Keine Details angegeben")
+                    if str(suggestion.get("link", "")).strip():
+                        st.markdown(f"[Link öffnen]({str(suggestion['link']).strip()})")
+                    if str(suggestion.get("image_url", "")).strip():
+                        st.caption(f"Bild: {str(suggestion['image_url']).strip()}")
 
                     a1, a2 = st.columns(2)
-                    if a1.button("Annehmen", key=f"approve_{suggestion['SuggestionId']}", use_container_width=True):
-                        if review_suggestion(str(suggestion["SuggestionId"]), approved=True, reviewer=user_name):
+                    if a1.button("Annehmen", key=f"approve_{suggestion['id']}", use_container_width=True):
+                        if review_suggestion(str(suggestion["id"]), approved=True, reviewer=user_name):
                             st.success("Vorschlag angenommen und global hinzugefügt.")
                             st.rerun()
-                    if a2.button("Ablehnen", key=f"reject_{suggestion['SuggestionId']}", use_container_width=True):
-                        if review_suggestion(str(suggestion["SuggestionId"]), approved=False, reviewer=user_name):
+                    if a2.button("Ablehnen", key=f"reject_{suggestion['id']}", use_container_width=True):
+                        if review_suggestion(str(suggestion["id"]), approved=False, reviewer=user_name):
                             st.info("Vorschlag abgelehnt.")
                             st.rerun()
                     st.divider()
@@ -1638,6 +1703,79 @@ def main() -> None:
         for _, row in phuket_activities.iterrows():
             st.markdown(f"- **{row['Name']}** ({format_currency(float(row['Kosten']))})")
             render_activity_info(row)
+
+    elif page == "Unterkunft/Transport hinzufügen":
+        st.subheader("Neue Unterkunft oder neuen Transport hinzufügen")
+        st.caption("Nur sichtbar für sarh/sarah und robin.")
+
+        tab_u, tab_t = st.tabs(["Unterkunft", "Transport"])
+
+        with tab_u:
+            with st.form("add_unterkunft_form", clear_on_submit=True):
+                u1, u2 = st.columns(2)
+                u_name = u1.text_input("Name")
+                u_cost = u2.number_input("Kosten pro Nacht", min_value=0.0, value=0.0, step=1.0)
+
+                u3, u4 = st.columns(2)
+                u_location = u3.selectbox("Standort", options=available_locations)
+                u_link = u4.text_input("Link", placeholder="https://...")
+
+                u_image = st.text_input("Bild-Link", placeholder="https://...jpg")
+                u_details = st.text_area("Details")
+                uv1, uv2 = st.columns(2)
+                u_adv = uv1.text_area("Vorteile")
+                u_disadv = uv2.text_area("Nachteile")
+
+                ut1, ut2, ut3 = st.columns(3)
+                u_transfer_mode = ut1.selectbox("Airport-Transfer", options=["Selbst", "Angeboten"])
+                u_transfer_cost = ut2.number_input("Transferkosten", min_value=0.0, value=0.0, step=1.0)
+                u_breakfast = ut3.selectbox("Frühstück inklusive", options=["Nein", "Ja"])
+
+                submit_u = st.form_submit_button("Unterkunft hinzufügen")
+
+            if submit_u:
+                success, msg = add_unterkunft_to_supabase(
+                    {
+                        "name": u_name.strip(),
+                        "cost": float(u_cost),
+                        "location": str(u_location).strip(),
+                        "link": u_link.strip(),
+                        "image_url": u_image.strip(),
+                        "details": u_details.strip(),
+                        "advantages": u_adv.strip(),
+                        "disadvantages": u_disadv.strip(),
+                        "airport_transfer": u_transfer_mode,
+                        "transfer_cost": float(u_transfer_cost),
+                        "breakfast_included": u_breakfast,
+                    }
+                )
+                if success:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        with tab_t:
+            with st.form("add_transport_form", clear_on_submit=True):
+                t1, t2 = st.columns(2)
+                t_name = t1.text_input("Transport-Name")
+                t_cost = t2.number_input("Kosten", min_value=0.0, value=0.0, step=1.0)
+                t_type = st.selectbox("Typ", options=["Flug", "Fähre", "Bus", "Zug", "Taxi", "Sonstiges"])
+                submit_t = st.form_submit_button("Transport hinzufügen")
+
+            if submit_t:
+                success, msg = add_transport_to_supabase(
+                    {
+                        "name": t_name.strip(),
+                        "cost": float(t_cost),
+                        "type": t_type,
+                    }
+                )
+                if success:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
     elif page == "Statistik":
         st.subheader("📊 Traumreisen Statistik")
