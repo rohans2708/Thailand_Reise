@@ -1377,7 +1377,7 @@ def main() -> None:
             "Anzahl Reisende",
             min_value=1,
             max_value=50,
-            value=int(get_initial_value("num_travelers", 4, snapshot)),
+            value=int(get_initial_value("num_travelers", 12, snapshot)),
             step=1,
             key="num_travelers",
         )
