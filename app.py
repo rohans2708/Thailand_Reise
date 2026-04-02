@@ -1234,7 +1234,11 @@ def main() -> None:
     load_persisted_state()
 
     st.title("Thailand Reise Auto-Konfigurator")
-    st.caption("Karten markieren ohne Seitenwechsel. Fluege bleiben ohne Bildauswahl.")
+    st.info(
+        "ℹ️ Alle Preise bei Unterkünften sind pro Nacht. "
+        "Bei der Unterkunft auf der Insel wird der Gesamtpreis zusätzlich durch die Anzahl der Reisenden geteilt. "
+        "Aktuell ist geplant: 4 Tage Bangkok, dann 9 Tage Insel und danach noch 1 Nacht in Bangkok."
+    )
 
     user_name = render_login_gate()
     if not user_name:
@@ -1314,6 +1318,10 @@ def main() -> None:
             st.session_state["_snapshot_loaded_for"] = active_user_key
 
     st.sidebar.markdown("### Schätzungen vor Ort")
+    st.sidebar.info(
+        "Hinweis: Die Werte in der Seitenleiste (z. B. Transportkosten, Verpflegung, Frühstücks-Abzug) "
+        "sind Schätzungen von uns/der KI und können jederzeit angepasst werden."
+    )
     num_travelers = int(
         st.sidebar.number_input(
             "Anzahl Reisende",
@@ -1329,7 +1337,7 @@ def main() -> None:
             "Tage Bangkok",
             min_value=0,
             max_value=30,
-            value=int(get_initial_value("days_bangkok", 3, snapshot)),
+            value=int(get_initial_value("days_bangkok", 5, snapshot)),
             step=1,
             key="days_bangkok",
         )
@@ -1339,7 +1347,7 @@ def main() -> None:
             "Tage Insel",
             min_value=0,
             max_value=30,
-            value=int(get_initial_value("days_island", 7, snapshot)),
+            value=int(get_initial_value("days_island", 9, snapshot)),
             step=1,
             key="days_island",
         )
@@ -1348,7 +1356,7 @@ def main() -> None:
         st.sidebar.number_input(
             "Transport vor Ort / Person / Tag",
             min_value=0.0,
-            value=float(get_initial_value("local_transport_per_day_pp", 12.0, snapshot)),
+            value=float(get_initial_value("local_transport_per_day_pp", 5.0, snapshot)),
             step=1.0,
             key="local_transport_per_day_pp",
         )
@@ -1357,7 +1365,7 @@ def main() -> None:
         st.sidebar.number_input(
             "Verpflegung / Person / Tag",
             min_value=0.0,
-            value=float(get_initial_value("food_per_day_pp", 30.0, snapshot)),
+            value=float(get_initial_value("food_per_day_pp", 15.0, snapshot)),
             step=1.0,
             key="food_per_day_pp",
         )
@@ -1366,7 +1374,7 @@ def main() -> None:
         st.sidebar.number_input(
             "Abzug bei Fruehstueck inkl. / Person / Tag",
             min_value=0.0,
-            value=float(get_initial_value("breakfast_discount_per_day_pp", 8.0, snapshot)),
+            value=float(get_initial_value("breakfast_discount_per_day_pp", 3.0, snapshot)),
             step=1.0,
             key="breakfast_discount_per_day_pp",
         )
@@ -1578,7 +1586,7 @@ def main() -> None:
         else:
             st.info("Sobald eine Ferienwohnung gewählt ist, erscheinen hier die Insel-Aktivitäten.")
 
-        st.subheader("7) Eigene Aktivitaet vorschlagen")
+        st.subheader("7) Eigene Aktivität vorschlagen")
         st.caption("Leere Felder bekommen automatisch sinnvolle Default-Werte. Robin kann Vorschläge freigeben oder ablehnen.")
         with st.form("custom_activity_form", clear_on_submit=True):
             ca1, ca2 = st.columns(2)
@@ -1762,7 +1770,7 @@ def main() -> None:
                 if t_type == "Flug":
                     f1, f2 = st.columns(2)
                     t_von = f1.text_input("von")
-                    t_nach = f2.text_input("nach")
+                    t_nach = f2.selectbox("nach", options=["Bangkok", "Ko Samui", "Phuket"], key="transport_nach_flug")
 
                     f3, f4 = st.columns(2)
                     t_flugzeit_hin = f3.text_input("Flugzeit hin")
@@ -1774,7 +1782,7 @@ def main() -> None:
                 else:
                     f1, f2 = st.columns(2)
                     t_von = f1.text_input("von")
-                    t_nach = f2.text_input("nach")
+                    t_nach = f2.selectbox("nach", options=["Bangkok", "Ko Samui", "Phuket"], key="transport_nach_faehre")
                     t_sonstiges = st.text_input("Sonstiges")
 
                 submit_t = st.form_submit_button("Transport hinzufügen")
