@@ -1104,7 +1104,7 @@ def image_select_grid(
                     render_activity_info(row)
                 if multiple:
                     btn_label = "Markierung entfernen" if is_selected else "Markieren"
-                    if st.button(btn_label, key=f"btn_{scope}_{idx}", use_container_width=True):
+                    if st.button(btn_label, key=f"btn_{scope}_{idx}", width="stretch"):
                         state_key = f"sel_{scope}"
                         selected_set = set(st.session_state.get(state_key, []))
                         if idx in selected_set:
@@ -1117,7 +1117,7 @@ def image_select_grid(
                         st.rerun()
                 else:
                     btn_label = "Ausgewählt" if is_selected else "Auswählen"
-                    if st.button(btn_label, key=f"btn_{scope}_{idx}", use_container_width=True):
+                    if st.button(btn_label, key=f"btn_{scope}_{idx}", width="stretch"):
                         st.session_state[f"sel_{scope}"] = idx
                         save_persisted_state()
                         st.rerun()
@@ -1327,7 +1327,7 @@ def main() -> None:
     with top_left:
         st.caption(f"Angemeldet als: {user_name}")
     with top_right:
-        if st.button("Abmelden", key="logout_main", use_container_width=True):
+        if st.button("Abmelden", key="logout_main", width="stretch"):
             st.session_state["is_authenticated"] = False
             st.session_state["auth_user"] = ""
             st.session_state["_snapshot_loaded_for"] = None
@@ -1337,7 +1337,7 @@ def main() -> None:
     # Bestimme Seitenliste: Statistik nur für Robin
     st.sidebar.markdown("### Nutzer")
     st.sidebar.write(f"Angemeldet als: **{user_name}**")
-    if st.sidebar.button("Abmelden", use_container_width=True):
+    if st.sidebar.button("Abmelden", width="stretch"):
         st.session_state["is_authenticated"] = False
         st.session_state["auth_user"] = ""
         st.session_state["_snapshot_loaded_for"] = None
@@ -1455,7 +1455,7 @@ def main() -> None:
                     "📥 Reisen",
                     CSV_USER_SAVES.read_bytes(),
                     "speicherstaende.csv",
-                    use_container_width=True
+                    width="stretch"
                 )
         
         with col2:
@@ -1464,7 +1464,7 @@ def main() -> None:
                     "📥 Vorschläge",
                     CSV_ACTIVITY_SUGGESTIONS.read_bytes(),
                     "aktivitaeten_vorschlaege.csv",
-                    use_container_width=True
+                    width="stretch"
                 )
         
         with col3:
@@ -1473,7 +1473,7 @@ def main() -> None:
                     "📥 Aktivitäten",
                     CSV_AKTIVITAETEN.read_bytes(),
                     "aktivitaeten.csv",
-                    use_container_width=True
+                    width="stretch"
                 )
 
     flight_df = df_transporte[df_transporte["Typ"].astype(str).str.lower() == "flug"].copy()
@@ -1669,7 +1669,7 @@ def main() -> None:
             st.markdown("**Deine offenen Vorschläge**")
             st.dataframe(
                 my_open[["created_at", "name", "location", "cost", "details", "link", "image_url"]],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -1693,11 +1693,11 @@ def main() -> None:
                         st.caption(f"Bild: {str(suggestion['image_url']).strip()}")
 
                     a1, a2 = st.columns(2)
-                    if a1.button("Annehmen", key=f"approve_{suggestion['id']}", use_container_width=True):
+                    if a1.button("Annehmen", key=f"approve_{suggestion['id']}", width="stretch"):
                         if review_suggestion(str(suggestion["id"]), approved=True, reviewer=user_name):
                             st.success("Vorschlag angenommen und global hinzugefügt.")
                             st.rerun()
-                    if a2.button("Ablehnen", key=f"reject_{suggestion['id']}", use_container_width=True):
+                    if a2.button("Ablehnen", key=f"reject_{suggestion['id']}", width="stretch"):
                         if review_suggestion(str(suggestion["id"]), approved=False, reviewer=user_name):
                             st.info("Vorschlag abgelehnt.")
                             st.rerun()
@@ -1747,7 +1747,7 @@ def main() -> None:
             )
             detail_df = pd.concat([detail_df, total_row], ignore_index=True)
             detail_df["Kosten"] = detail_df["Kosten"].map(format_currency)
-            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+            st.dataframe(detail_df, width="stretch", hide_index=True)
         else:
             st.info("Noch keine Positionen ausgewählt.")
 
@@ -1959,7 +1959,7 @@ def main() -> None:
                  "BangkokHotel", "InselUnterkunft", "InselZiel", "PreisProPerson"]
             ].copy()
             display_df["PreisProPerson"] = display_df["PreisProPerson"].apply(format_currency)
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, width="stretch", hide_index=True)
             
             st.divider()
             
