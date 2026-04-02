@@ -7,6 +7,7 @@ import re
 import unicodedata
 from urllib.parse import quote
 from uuid import uuid4
+import os
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +26,8 @@ try:
     from supabase import create_client, Client
     SUPABASE_AVAILABLE = True
 except ImportError:
+    create_client = None
+    Client = object
     SUPABASE_AVAILABLE = False
 
 @st.cache_resource
@@ -45,6 +48,17 @@ def get_supabase_client() -> Client | None:
     except Exception as e:
         st.warning(f"Supabase-Verbindung fehlgeschlagen: {e}")
         return None
+
+
+def allow_local_csv_seeding() -> bool:
+    """Erlaubt CSV-Seeding nur, wenn es explizit lokal aktiviert wurde."""
+    value = st.secrets.get("LOCAL_CSV_SEEDING", False)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def should_seed_csvs_for_user(user_name: str) -> bool:
+    """CSV-Seeding nur für Robin und nur lokal."""
+    return allow_local_csv_seeding() and str(user_name).strip().lower() == "robin"
 
 BASE_DIR = Path(__file__).parent
 CSV_UNTERKUENFTE = BASE_DIR / "unterkuenfte.csv"
@@ -317,27 +331,16 @@ def _normalize_suggestions_df_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_activity_suggestions() -> pd.DataFrame:
-    """Lädt Activity Suggestions aus Supabase (primary). CSVs nur zum initialen Seeden."""
+    """Lädt Activity Suggestions aus Supabase (primary)."""
     client = get_supabase_client()
-    
-    # IMMER versuchen, aus Supabase zu laden (das ist jetzt Primary Storage)
+
     if client:
         try:
             response = client.table("activity_suggestions").select("*").execute()
             if response.data:
                 return _normalize_suggestions_df_columns(pd.DataFrame(response.data))
         except Exception as e:
-            # Wenn Tabelle nicht existiert: OK, initialisieren wir sie mit CSVs
-            st.info(f"ℹ️ Supabase-Tabelle noch nicht initialisiert: {str(e)[:100]}")
-    
-    # Fallback: Lies CSV (zum Initialisieren, nicht als Backup)
-    if CSV_ACTIVITY_SUGGESTIONS.exists():
-        df = pd.read_csv(CSV_ACTIVITY_SUGGESTIONS)
-        df.columns = [str(col).strip() for col in df.columns]
-        # Schreibe CSV-Daten zu Supabase (einmaliges Seeding)
-        _seed_activity_suggestions_to_supabase(df)
-        # Danach normalisiert zurückgeben (wichtig für Review/Approve-Flow)
-        return _normalize_suggestions_df_columns(df)
+            st.info(f"ℹ️ Supabase-Suggestions nicht lesbar: {str(e)[:100]}")
     
     return _empty_suggestions_df()
 
@@ -800,7 +803,6 @@ def _seed_aktivitaeten_to_supabase_from_csv(client: Client) -> None:
 
 
 def _load_unterkuenfte_from_supabase(client: Client) -> pd.DataFrame:
-    _seed_unterkuenfte_to_supabase_from_csv(client)
     response = client.table("unterkuenfte").select("*").execute()
     rows = response.data or []
     if not rows:
@@ -825,7 +827,6 @@ def _load_unterkuenfte_from_supabase(client: Client) -> pd.DataFrame:
 
 
 def _load_transporte_from_supabase(client: Client) -> pd.DataFrame:
-    _seed_transporte_to_supabase_from_csv(client)
     response = client.table("transporte").select("*").execute()
     rows = response.data or []
     if not rows:
@@ -841,7 +842,6 @@ def _load_transporte_from_supabase(client: Client) -> pd.DataFrame:
 
 
 def _load_aktivitaeten_from_supabase(client: Client) -> pd.DataFrame:
-    _seed_aktivitaeten_to_supabase_from_csv(client)
     response = client.table("aktivitaeten").select("*").execute()
     rows = response.data or []
     if not rows:
@@ -859,6 +859,22 @@ def _load_aktivitaeten_from_supabase(client: Client) -> pd.DataFrame:
     )
 
 
+def seed_csv_data_to_supabase_for_robin() -> None:
+    """Seedet CSVs in Supabase nur lokal und nur für Robin."""
+    if not should_seed_csvs_for_user(str(st.session_state.get("user_name", ""))):
+        return
+
+    client = get_supabase_client()
+    if client is None:
+        return
+
+    if CSV_ACTIVITY_SUGGESTIONS.exists():
+        _seed_activity_suggestions_to_supabase(_read_clean_csv(CSV_ACTIVITY_SUGGESTIONS))
+    _seed_unterkuenfte_to_supabase_from_csv(client)
+    _seed_transporte_to_supabase_from_csv(client)
+    _seed_aktivitaeten_to_supabase_from_csv(client)
+
+
 def load_csv_files() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     def _read_clean(path: Path) -> pd.DataFrame:
         df = pd.read_csv(path)
@@ -871,7 +887,7 @@ def load_csv_files() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         st.error("Supabase nicht verfügbar. Bitte SUPABASE_URL und SUPABASE_ANON_KEY prüfen.")
         st.stop()
 
-    # Katalogdaten: Supabase primary, CSV nur als Seed
+    # Katalogdaten: nur lesen, kein Seeding hier
     unterkuenfte_df = _load_unterkuenfte_from_supabase(client)
     transporte_df = _load_transporte_from_supabase(client)
     aktivitaeten_df = _load_aktivitaeten_from_supabase(client)
@@ -1225,8 +1241,22 @@ def render_login_gate() -> str | None:
 
 
 def main() -> None:
-    create_dummy_csv_files()
     load_persisted_state()
+
+    st.title("Thailand Reise Auto-Konfigurator")
+    st.caption("Karten markieren ohne Seitenwechsel. Fluege bleiben ohne Bildauswahl.")
+
+    user_name = render_login_gate()
+    if not user_name:
+        st.stop()
+
+    if allow_local_csv_seeding():
+        create_dummy_csv_files()
+
+    if should_seed_csvs_for_user(user_name) and not st.session_state.get("_csv_seed_done"):
+        seed_csv_data_to_supabase_for_robin()
+        st.session_state["_csv_seed_done"] = True
+
     df_unterkuenfte, df_aktivitaeten, df_transporte = load_csv_files()
 
     df_unterkuenfte = ensure_columns(
@@ -1250,12 +1280,6 @@ def main() -> None:
     df_aktivitaeten = ensure_columns(df_aktivitaeten, {"Bild": "", "Details": "", "Link": ""})
     df_aktivitaeten = attach_image_column(prepare_location_column(df_aktivitaeten), "aktivitaet")
 
-    st.title("Thailand Reise Auto-Konfigurator")
-    st.caption("Karten markieren ohne Seitenwechsel. Fluege bleiben ohne Bildauswahl.")
-
-    user_name = render_login_gate()
-    if not user_name:
-        st.stop()
 
     top_left, top_right = st.columns([4, 1])
     with top_left:
