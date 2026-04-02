@@ -1031,6 +1031,47 @@ def render_activity_info(row: pd.Series, expanded: bool = False) -> None:
             st.markdown(f"[Beispiel-Link (Suche)](https://www.google.com/search?q={query})")
 
 
+def _find_accommodation_image(name: str, unterkuenfte_df: pd.DataFrame) -> str:
+    """Liefert ein passendes Bild zur Unterkunft (mit Fallback)."""
+    if unterkuenfte_df.empty or "Name" not in unterkuenfte_df.columns:
+        return build_default_image_url(name, "unterkunft-stat")
+
+    target = normalize_text(name)
+    candidates = unterkuenfte_df[unterkuenfte_df["Name"].astype(str).map(normalize_text) == target]
+    if not candidates.empty:
+        row = candidates.iloc[0]
+        img = str(row.get("BildUrl", "")).strip() or str(row.get("Bild", "")).strip()
+        if img:
+            return img
+
+    return build_default_image_url(name, "unterkunft-stat")
+
+
+def render_accommodation_popularity_with_images(
+    counts: pd.Series,
+    unterkuenfte_df: pd.DataFrame,
+    title: str,
+) -> None:
+    """Rendert eine Popularitätsansicht mit Bild + Balken pro Unterkunft."""
+    st.markdown(f"**{title}**")
+    if counts.empty:
+        st.caption("Noch keine passenden Daten vorhanden.")
+        return
+
+    max_count = int(counts.max()) if len(counts) else 1
+    max_count = max(1, max_count)
+
+    for name, count in counts.items():
+        image_url = _find_accommodation_image(str(name), unterkuenfte_df)
+        c_img, c_bar = st.columns([1, 4])
+        with c_img:
+            st.image(image_url, width=120)
+        with c_bar:
+            st.markdown(f"**{name}**")
+            st.progress(float(count) / float(max_count))
+            st.caption(f"{int(count)}x gewählt")
+
+
 def image_select_grid(
     df: pd.DataFrame,
     scope: str,
@@ -1972,21 +2013,20 @@ def main() -> None:
             st.divider()
             st.markdown("### Wünsche nach Unterkunft")
 
-            st.markdown("**Bangkok Hotels (Häufigkeit)**")
             bangkok_hotel_counts = (
                 saves_df["BangkokHotel"].astype(str).str.strip().replace({"": pd.NA}).dropna().value_counts().head(10)
             )
-            if not bangkok_hotel_counts.empty:
-                st.bar_chart(bangkok_hotel_counts)
-            else:
-                st.caption("Noch keine Daten für Bangkok-Hotels vorhanden.")
+            render_accommodation_popularity_with_images(
+                bangkok_hotel_counts,
+                df_unterkuenfte,
+                "Bangkok Hotels (Häufigkeit)",
+            )
 
             island_targets = (
                 saves_df["InselZiel"].astype(str).str.strip().replace({"": pd.NA}).dropna().unique().tolist()
             )
             if island_targets:
                 for island in sorted(island_targets):
-                    st.markdown(f"**Unterkünfte auf {island} (Häufigkeit)**")
                     mask = saves_df["InselZiel"].astype(str).str.strip().eq(island)
                     island_counts = (
                         saves_df.loc[mask, "InselUnterkunft"]
@@ -1997,10 +2037,11 @@ def main() -> None:
                         .value_counts()
                         .head(10)
                     )
-                    if not island_counts.empty:
-                        st.bar_chart(island_counts)
-                    else:
-                        st.caption(f"Noch keine Unterkunftsdaten für {island} vorhanden.")
+                    render_accommodation_popularity_with_images(
+                        island_counts,
+                        df_unterkuenfte,
+                        f"Unterkünfte auf {island} (Häufigkeit)",
+                    )
             
         else:
             st.info("Noch keine Traumreisen gespeichert.")
