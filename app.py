@@ -1750,9 +1750,8 @@ def main() -> None:
         with tab_t:
             with st.form("add_transport_form", clear_on_submit=True):
                 t1, t2 = st.columns(2)
-                t_name = t1.text_input("Transport-Name")
-                t_cost = t2.number_input("Kosten", min_value=0.0, value=0.0, step=1.0)
-                t_type = st.selectbox("Typ", options=["Flug", "Fähre", "Bus", "Zug", "Taxi", "Sonstiges"])
+                t_cost = t1.number_input("Kosten", min_value=0.0, value=0.0, step=1.0)
+                t_type = t2.selectbox("Typ", options=["Flug", "Fähre"])
 
                 t_von = ""
                 t_nach = ""
@@ -1772,11 +1771,16 @@ def main() -> None:
                     f5, f6 = st.columns(2)
                     t_zwischenstop_ort = f5.text_input("Zwischenstop Ort")
                     t_sonstiges = f6.text_input("Sonstiges")
+                else:
+                    f1, f2 = st.columns(2)
+                    t_von = f1.text_input("von")
+                    t_nach = f2.text_input("nach")
+                    t_sonstiges = st.text_input("Sonstiges")
 
                 submit_t = st.form_submit_button("Transport hinzufügen")
 
             if submit_t:
-                final_transport_name = t_name.strip()
+                final_transport_name = ""
                 if t_type == "Flug":
                     if not t_von.strip() or not t_nach.strip():
                         st.error("Für Flug bitte mindestens 'von' und 'nach' angeben.")
@@ -1790,6 +1794,11 @@ def main() -> None:
                             zwischenstop_ort=t_zwischenstop_ort.strip() or "kein",
                             sonstiges=t_sonstiges.strip() or "-",
                         )
+                else:
+                    von_text = t_von.strip() or "k. A."
+                    nach_text = t_nach.strip() or "k. A."
+                    sonstiges_text = t_sonstiges.strip() or "-"
+                    final_transport_name = f"Fähre ({von_text} - {nach_text}); Sonstiges: {sonstiges_text}"
 
                 if not final_transport_name:
                     pass
