@@ -513,12 +513,21 @@ def add_unterkunft_to_supabase(payload: dict[str, object]) -> tuple[bool, str]:
     if not client:
         return False, "Supabase nicht verbunden."
 
-    name = str(payload.get("name", "")).strip()
+    name_raw = str(payload.get("name", "")).strip()
     location = str(payload.get("location", "")).strip()
+    name = name_raw
+    if name_raw and location:
+        suffix = f"({location})"
+        if not name_raw.endswith(suffix):
+            name = f"{name_raw} {suffix}"
+
     cost = float(payload.get("cost", 0) or 0)
     link = str(payload.get("link", "")).strip()
     if not name or not location:
         return False, "Name und Standort sind Pflichtfelder."
+
+    payload = dict(payload)
+    payload["name"] = name
 
     try:
         existing = (
@@ -1296,7 +1305,7 @@ def main() -> None:
 
     active_user_key = str(user_name).strip().lower()
 
-    seiten_liste = ["Konfigurator", "Übersicht Kosten", "Übersicht Auswahl"]
+    seiten_liste = ["Konfigurator", "Übersicht"]
     admin_data_users = {"robin", "sarh", "sarah"}
     if active_user_key in admin_data_users:
         seiten_liste.append("Unterkunft/Transport hinzufügen")
@@ -1683,21 +1692,19 @@ def main() -> None:
             save_user_snapshot(snapshot_record)
             st.success(f"Gespeichert für {user_name.strip()}.")
 
-    elif page == "Übersicht Kosten":
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Flüge pro Person", format_currency(costs_flights))
-        c2.metric("Transport sonstiges pro Person", format_currency(costs_transport_other))
-        c3.metric("Hotel Bangkok pro Person", format_currency(costs_bkk_hotel))
-        c4.metric("Insel-Unterkunft anteilig p.P.", format_currency(costs_island_home))
-        c5.metric("Aktivitäten pro Person", format_currency(costs_activities))
-        c6.metric("Verpflegung netto pro Person", format_currency(costs_food))
-        st.caption(f"Unterkünfte gesamt pro Person: {format_currency(costs_accommodation)}")
-        st.metric("Preis pro Person", format_currency(per_person))
+    elif page == "Übersicht":
+        st.subheader("Übersicht")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Gesamt pro Person", format_currency(per_person))
+        c2.metric("Flüge pro Person", format_currency(costs_flights))
+        c3.metric("Unterkünfte gesamt p.P.", format_currency(costs_accommodation))
 
-    elif page == "Übersicht Auswahl":
-        st.subheader("Auswahl-Liste")
         if rows:
             detail_df = pd.DataFrame(rows)
+            total_row = pd.DataFrame(
+                [{"Kategorie": "Gesamt pro Person", "Name": "Endsumme", "Kosten": float(per_person)}]
+            )
+            detail_df = pd.concat([detail_df, total_row], ignore_index=True)
             detail_df["Kosten"] = detail_df["Kosten"].map(format_currency)
             st.dataframe(detail_df, use_container_width=True, hide_index=True)
         else:
@@ -1826,9 +1833,51 @@ def main() -> None:
 
     elif page == "Statistik":
         st.subheader("📊 Traumreisen Statistik")
-        if CSV_USER_SAVES.exists():
+        saves_df = pd.DataFrame()
+        client = get_supabase_client()
+        if client is not None:
+            try:
+                response = client.table("saved_travels").select("*").execute()
+                if response.data:
+                    raw = pd.DataFrame(response.data)
+                    saves_df = pd.DataFrame(
+                        {
+                            "Zeitstempel": raw.get("created_at", ""),
+                            "Name": raw.get("user_name", ""),
+                            "Personen": raw.get("num_travelers", 0),
+                            "TageBangkok": raw.get("days_bangkok", 0),
+                            "TageInsel": raw.get("days_island", 0),
+                            "BangkokHotel": raw.get("bkk_hotel", ""),
+                            "InselUnterkunft": raw.get("island_accommodation", ""),
+                            "InselZiel": raw.get("island_destination", ""),
+                            "PreisProPerson": raw.get("total_per_person", 0),
+                            "KostenFluegePP": raw.get("cost_flights", 0),
+                            "KostenTransportSonstPP": raw.get("cost_transport", 0),
+                            "KostenHotelBangkokPP": raw.get("cost_hotel", 0),
+                            "KostenInselUnterkunftPP": raw.get("cost_island", 0),
+                            "KostenAktivitätenPP": raw.get("cost_activities", 0),
+                            "KostenVerpflegungPP": raw.get("cost_food", 0),
+                        }
+                    )
+            except Exception:
+                saves_df = pd.DataFrame()
+
+        if saves_df.empty and CSV_USER_SAVES.exists():
             saves_df = pd.read_csv(CSV_USER_SAVES)
             saves_df.columns = [str(col).strip() for col in saves_df.columns]
+
+        if not saves_df.empty:
+            for num_col in [
+                "PreisProPerson",
+                "KostenFluegePP",
+                "KostenTransportSonstPP",
+                "KostenHotelBangkokPP",
+                "KostenInselUnterkunftPP",
+                "KostenAktivitätenPP",
+                "KostenVerpflegungPP",
+            ]:
+                if num_col in saves_df.columns:
+                    saves_df[num_col] = pd.to_numeric(saves_df[num_col], errors="coerce").fillna(0.0)
             
             # Grundstatistiken
             col1, col2, col3, col4 = st.columns(4)
@@ -1836,6 +1885,11 @@ def main() -> None:
             col2.metric("Verschiedene Nutzer", saves_df["Name"].nunique())
             col3.metric("Durchschn. Preis pro Person", format_currency(saves_df["PreisProPerson"].mean()))
             col4.metric("Höchster Preis pro Person", format_currency(saves_df["PreisProPerson"].max()))
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Niedrigster Preis pro Person", format_currency(saves_df["PreisProPerson"].min()))
+            m2.metric("Median Preis pro Person", format_currency(float(saves_df["PreisProPerson"].median())))
+            m3.metric("Spannweite (Max-Min)", format_currency(saves_df["PreisProPerson"].max() - saves_df["PreisProPerson"].min()))
             
             st.divider()
             
@@ -1896,6 +1950,39 @@ def main() -> None:
                 for island, count in island_top.items():
                     if island:
                         st.write(f"• {island}: {count}x")
+
+            st.divider()
+            st.markdown("### Wünsche nach Unterkunft")
+
+            st.markdown("**Bangkok Hotels (Häufigkeit)**")
+            bangkok_hotel_counts = (
+                saves_df["BangkokHotel"].astype(str).str.strip().replace({"": pd.NA}).dropna().value_counts().head(10)
+            )
+            if not bangkok_hotel_counts.empty:
+                st.bar_chart(bangkok_hotel_counts)
+            else:
+                st.caption("Noch keine Daten für Bangkok-Hotels vorhanden.")
+
+            island_targets = (
+                saves_df["InselZiel"].astype(str).str.strip().replace({"": pd.NA}).dropna().unique().tolist()
+            )
+            if island_targets:
+                for island in sorted(island_targets):
+                    st.markdown(f"**Unterkünfte auf {island} (Häufigkeit)**")
+                    mask = saves_df["InselZiel"].astype(str).str.strip().eq(island)
+                    island_counts = (
+                        saves_df.loc[mask, "InselUnterkunft"]
+                        .astype(str)
+                        .str.strip()
+                        .replace({"": pd.NA})
+                        .dropna()
+                        .value_counts()
+                        .head(10)
+                    )
+                    if not island_counts.empty:
+                        st.bar_chart(island_counts)
+                    else:
+                        st.caption(f"Noch keine Unterkunftsdaten für {island} vorhanden.")
             
         else:
             st.info("Noch keine Traumreisen gespeichert.")
