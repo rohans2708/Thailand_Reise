@@ -525,98 +525,8 @@ def selected_names(df: pd.DataFrame) -> str:
 
 
 def create_dummy_csv_files() -> None:
-    """Erzeugt Demo-CSV-Dateien, falls keine Dateien vorhanden sind."""
-    if not CSV_UNTERKUENFTE.exists():
-        pd.DataFrame(
-            {
-                "Name": [
-                    "The Peninsula Bangkok",
-                    "Mandarin Oriental Bangkok",
-                    "Bangkok Riverside Suites",
-                    "Lamai Sea View Apartment",
-                    "Bophut Family Residence",
-                    "Phuket Beach Apartment",
-                    "Patong Hill Residence",
-                ],
-                "Kosten": [900, 1200, 600, 420, 510, 460, 540],
-                "Standort": ["Bangkok", "Bangkok", "Bangkok", "Ko Samui", "Ko Samui", "Phuket", "Phuket"],
-                "Link": [
-                    "https://example.com/peninsula-bangkok",
-                    "https://example.com/mandarin-bangkok",
-                    "https://www.airbnb.com/s/Bangkok--Thailand/homes",
-                    "https://www.airbnb.com/s/Ko-Samui--Thailand/homes",
-                    "https://www.airbnb.com/s/Bo-Phut--Thailand/homes",
-                    "https://www.airbnb.com/s/Phuket--Thailand/homes",
-                    "https://www.airbnb.com/s/Patong--Thailand/homes",
-                ],
-                "Bild": ["", "", "", "", "", "", ""],
-                "Details": [
-                    "Luxushotel mit Flussblick",
-                    "Top-Service und zentrale Lage",
-                    "Preiswerte Option in Bangkok",
-                    "Ruhig und strandnah",
-                    "Ideal fuer Gruppen",
-                    "Direkt am Strand",
-                    "Gute Aussicht und ruhig",
-                ],
-                "Vorteile": ["", "", "", "", "", "", ""],
-                "Nachteile": ["", "", "", "", "", "", ""],
-                "AirportTransfer": ["Angeboten", "Angeboten", "Selbst", "Selbst", "Angeboten", "Selbst", "Angeboten"],
-                "TransferKosten": [60, 75, 40, 35, 25, 30, 20],
-                "FruehstueckInklusive": ["Ja", "Ja", "Nein", "Nein", "Nein", "Nein", "Ja"],
-            }
-        ).to_csv(CSV_UNTERKUENFTE, index=False)
-
-    if not CSV_AKTIVITAETEN.exists():
-        pd.DataFrame(
-            {
-                "Name": [
-                    "Grand Palace Tour",
-                    "Street Food Night Tour",
-                    "Floating Market Day Trip",
-                    "Ang Thong National Park Boat Trip",
-                    "Ko Samui Elephant Sanctuary",
-                    "Phang Nga Bay Tour",
-                    "Phuket Old Town Food Walk",
-                ],
-                "Kosten": [45, 39, 60, 75, 55, 82, 34],
-                "Standort": ["Bangkok", "Bangkok", "Bangkok", "Ko Samui", "Ko Samui", "Phuket", "Phuket"],
-                "Link": [
-                    "https://example.com/grand-palace",
-                    "https://example.com/street-food",
-                    "https://example.com/floating-market",
-                    "https://example.com/ang-thong",
-                    "https://example.com/elephant-sanctuary",
-                    "https://example.com/phang-nga",
-                    "https://example.com/phuket-old-town",
-                ],
-                "Bild": ["", "", "", "", "", "", ""],
-                "Details": [
-                    "Gefuehrte Tour durch Tempel und Altstadt",
-                    "Street-Food Stops mit Guide",
-                    "Tagesausflug mit Boot und Marktbesuch",
-                    "Ganztages-Bootstour zu Inseln",
-                    "Ethisches Sanctuary ohne Reiten",
-                    "Naturtour mit Speedboat",
-                    "Kulinarischer Stadtspaziergang",
-                ],
-            }
-        ).to_csv(CSV_AKTIVITAETEN, index=False)
-
-    if not CSV_TRANSPORTE.exists():
-        pd.DataFrame(
-            {
-                "Name": [
-                    "Flug Frankfurt - Bangkok (Hin und Rueckflug)",
-                    "Flug Muenchen - Bangkok (Hin und Rueckflug)",
-                    "Flug Bangkok - Phuket",
-                    "Flug Bangkok - Ko Samui",
-                    "Fähre Phuket - Ko Samui",
-                ],
-                "Kosten": [780, 720, 130, 165, 48],
-                "Typ": ["Flug", "Flug", "Flug", "Flug", "Fähre"],
-            }
-        ).to_csv(CSV_TRANSPORTE, index=False)
+    """Bewusst deaktiviert: Es werden keine Default-/Demo-Daten mehr erzeugt."""
+    return
 
 
 def _read_clean_csv(path: Path) -> pd.DataFrame:
@@ -1250,8 +1160,6 @@ def main() -> None:
     if not user_name:
         st.stop()
 
-    if allow_local_csv_seeding():
-        create_dummy_csv_files()
 
     if should_seed_csvs_for_user(user_name) and not st.session_state.get("_csv_seed_done"):
         seed_csv_data_to_supabase_for_robin()
