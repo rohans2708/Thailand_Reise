@@ -13,6 +13,8 @@ import os
 import pandas as pd
 import streamlit as st
 
+SHOW_ZERO_COST_ACTIVITIES = False
+
 st.set_page_config(page_title="Thailand Auto-Konfigurator", page_icon="TH", layout="wide")
 
 try:
@@ -124,6 +126,32 @@ PERSIST_KEYS = [
     "breakfast_discount_per_day_pp",
     "num_travelers",
 ]
+
+
+def _is_zero_cost_value(value: object) -> bool:
+    """Erkennt zuverlässig echte 0€-Werte, ohne unbekannte Werte zu verstecken."""
+    if value is None:
+        return False
+    if isinstance(value, float) and pd.isna(value):
+        return False
+
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan"}:
+        return False
+
+    try:
+        return float(text.replace(",", ".")) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def filter_zero_cost_activities(df: pd.DataFrame, show_zero_cost_activities: bool) -> pd.DataFrame:
+    """Filtert Aktivitäten mit Kosten 0 nur dann heraus, wenn sie global verborgen sind."""
+    if df.empty or show_zero_cost_activities or "Kosten" not in df.columns:
+        return df
+
+    # Unbekannte Kosten bleiben sichtbar; nur echte 0€-Einträge werden verborgen.
+    return df[~df["Kosten"].map(_is_zero_cost_value)].copy()
 
 
 def get_cookie_manager():
@@ -1362,6 +1390,7 @@ def main() -> None:
 
     df_aktivitaeten = ensure_columns(df_aktivitaeten, {"Bild": "", "Details": "", "Link": ""})
     df_aktivitaeten = attach_image_column(prepare_location_column(df_aktivitaeten), "aktivitaet")
+    df_aktivitaeten = filter_zero_cost_activities(df_aktivitaeten, SHOW_ZERO_COST_ACTIVITIES)
 
 
     top_left, top_right = st.columns([4, 1])
@@ -1474,6 +1503,10 @@ def main() -> None:
 
     if active_user_key == "robin":
         st.sidebar.markdown("### Admin")
+        st.sidebar.caption(
+            f"0€-Aktivitäten: {'sichtbar' if SHOW_ZERO_COST_ACTIVITIES else 'ausgeblendet'} (per Code-Bool)"
+        )
+
         admin_cmd = st.sidebar.text_input("Befehl", placeholder="download")
         if admin_cmd.strip().lower() in {"download", "download_csv", "export"}:
             if CSV_USER_SAVES.exists():
